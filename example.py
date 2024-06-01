@@ -1,5 +1,5 @@
-from src.graphrag import GraphRAG
-from src.models import Node, Edge
+from graphrag.graphrag import GraphRAG
+from graphrag.models import Node, Edge
 
 
 # Initialize the database from disk (make sure to set vector_length correctly)
