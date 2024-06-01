@@ -1,4 +1,5 @@
 # GraphMemory - GraphRAG Database
+![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/4b311a85-0a7c-4b75-9423-9182afe2a077)
 
 ## Overview
 This project provides an embedded graph database implementation with vector similarity search (VSS) using DuckDB. It includes a Python class `GraphRAG` for managing nodes and edges. 
