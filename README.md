@@ -12,11 +12,6 @@ This database can be used for any graph-based RAG application or knowledge graph
 
 Vector embeddings can be created using [sentence-transformers](https://www.sbert.net/) or other API based models.
 
-## Requirements
-- Python 3.x
-- DuckDB
-- Pydantic
-
 ## Installation
 1. Clone the repository:
     ```sh
