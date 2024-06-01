@@ -3,7 +3,7 @@ import json
 import os
 import logging
 from contextlib import contextmanager
-from src.models import Node, Edge, Neighbor
+from graphrag.models import Node, Edge, Neighbor
 from typing import List
 
 
