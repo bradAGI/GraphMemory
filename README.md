@@ -63,7 +63,7 @@ edges = graph_db.edges_to_json()
 print("Edges:", edges)
 
 # Find connected nodes
-connected_nodes = graph_db.get_connected_nodes(node1_id)
+connected_nodes = graph_db.connected_nodes(node1_id)
 print("Connected Nodes:", connected_nodes)
 
 # Find nearest neighbors
@@ -76,26 +76,20 @@ graph_db.insert_edge(edge)
 
 # Define the additional nodes for bulk insert
 nodes = [
-    Node(data={"name": "Alexander Hamilton", "role": "Secretary of the Treasury"}, vector=[0.7, 0.8, 0.9]),
-    Node(data={"name": "John Jay", "role": "Secretary of State", "term": "1789–1790"}, vector=[0.1, 0.2, 0.3]),
-    Node(data={"name": "Edmund Randolph", "role": "Secretary of State", "term": "1794–1795"}, vector=[0.7, 0.8, 0.9]),
-    Node(data={"name": "Timothy Pickering", "role": "Secretary of State", "term": "1795–1797"}, vector=[1.0, 1.1, 1.2]),
+    Node(data={"name": "Alexander Hamilton", "role": "Secretary of the Treasury", "term": "1789–1795"}, vector=[0.7, 0.8, 0.9]),
     Node(data={"name": "Oliver Wolcott Jr.", "role": "Secretary of the Treasury", "term": "1795–1797"}, vector=[1.6, 1.7, 1.8]),
-    Node(data={"name": "Henry Knox", "role": "Secretary of War", "term": "1789–1794"}, vector=[1.9, 2.0, 2.1]),
-    Node(data={"name": "James McHenry", "role": "Secretary of War", "term": "1796–1797"}, vector=[2.2, 2.3, 2.4]),
-    Node(data={"name": "Edmund Randolph", "role": "Attorney General", "term": "1789–1794"}, vector=[2.5, 2.6, 2.7]),
-    Node(data={"name": "William Bradford", "role": "Attorney General", "term": "1794–1795"}, vector=[2.8, 2.9, 3.0]),
-    Node(data={"name": "Charles Lee", "role": "Attorney General", "term": "1795–1797"}, vector=[3.1, 3.2, 3.3])
 ]
 
 # Bulk insert nodes
 graph_db.bulk_insert_nodes(nodes)
 
-# Bulk insert edges with relations
+# Define the additional edges for bulk insert
 edges = [
-    Edge(source_id=nodes[1].id, target_id=nodes[2].id, relation="succeeded_by", weight=0.7),
-    Edge(source_id=nodes[2].id, target_id=nodes[3].id, relation="succeeded_by", weight=0.8)
+    Edge(source_id=nodes[0].id, target_id=nodes[1].id, relation="succeeded_by", weight=0.7),
+    Edge(source_id=nodes[1].id, target_id=nodes[2].id, relation="succeeded_by", weight=0.8)
 ]
+
+# Bulk insert edges
 graph_db.bulk_insert_edges(edges)
 
 # Delete a node
@@ -104,14 +98,68 @@ graph_db.delete_node(nodes[-1].id)
 # Delete an edge
 graph_db.delete_edge(1, 2)
 
-# Find nearest neighbors by vector distance
+# Find nearest nodes to a given vector by distance
 neighbors = graph_db.nearest_neighbors(vector=[0.1, 0.2, 0.3], limit=2)
 print("Nearest Neighbors:", neighbors)
 
-# Find connected nodes to John Jay
-connected_nodes = graph_db.get_connected_nodes(nodes[1].id)
+# Find connected nodes
+connected_nodes = graph_db.connected_nodes(nodes[1].id)
 print("Connected Nodes:", connected_nodes)
 ```
+
+## GraphRAG Class Methods
+
+The `GraphRAG` class provides the following public methods for interacting with the graph database:
+
+1. `__init__(self, database=None, vector_length=3)`
+   - Initializes the database connection and sets up the database schema if necessary.
+
+2. `set_vector_length(self, vector_length)`
+   - Sets the length of the vectors for the nodes in the database.
+
+3. `create_tables(self)`
+   - Creates the necessary database tables for nodes and edges if they do not exist.
+
+4. `insert_node(self, node: Node) -> int`
+   - Inserts a node into the database and returns the node ID.
+
+5. `insert_edge(self, edge: Edge)`
+   - Inserts an edge between two nodes in the database.
+
+6. `bulk_insert_nodes(self, nodes: List[Node]) -> List[Node]`
+   - Performs a bulk insert of multiple nodes into the database.
+
+7. `bulk_insert_edges(self, edges: List[Edge])`
+   - Performs a bulk insert of multiple edges into the database.
+
+8. `delete_node(self, node_id: int)`
+   - Deletes a node and its associated edges from the database.
+
+9. `delete_edge(self, source_id: int, target_id: int)`
+   - Deletes an edge from the database.
+
+10. `create_index(self)`
+    - Creates an index on the node vectors to improve search performance.
+
+11. `nearest_neighbors(self, vector: List[float], limit: int) -> List[Neighbor]`
+    - Finds and returns the nearest neighbor nodes based on vector similarity.
+
+12. `connected_nodes(self, node_id: int) -> List[Node]`
+    - Retrieves all nodes directly connected to the specified node.
+
+13. `nodes_to_json(self)`
+    - Returns a JSON representation of all nodes in the database.
+
+14. `edges_to_json(self)`
+    - Returns a JSON representation of all edges in the database.
+
+15. `get_node(self, node_id: int)`
+    - Retrieves a specific node by its ID.
+
+16. `print_json(self)`
+    - Prints the JSON representation of all nodes and edges in the database.
+
+These methods facilitate the management and querying of the graph database, allowing for efficient data handling and retrieval.
 
 ## Testing
 Unit tests are provided in `tests/tests.py`.
