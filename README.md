@@ -36,7 +36,7 @@ If you do not provide an ID for a node or edge, the database will automatically 
 
 ### Example
 ```python
-from graphrag.graphrag import GraphRAG
+from graphrag.database import GraphRAG
 from graphrag.models import Node, Edge
 
 
