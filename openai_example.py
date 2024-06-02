@@ -1,4 +1,4 @@
-from graphrag.database import GraphRAG
+from graphrag import GraphRAG
 from graphrag.models import Node, Edge
 
 import json
