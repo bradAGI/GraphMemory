@@ -1,2 +1,2 @@
-duckdb==0.10.3
-pydantic==2.7.2
+duckdb==1.0.0
+pydantic==2.7.3
