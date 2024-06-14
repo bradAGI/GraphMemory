@@ -224,7 +224,7 @@ class GraphMemory:
         try:
             nodes = self.conn.execute(
                 "SELECT id, type, properties, vector FROM nodes;").fetchall()
-            return [{"id": row[0], "type": row[1], "properties": json.loads(row[2]), "vector": row[3]} for row in nodes]
+            return [{"id": str(row[0]), "type": row[1], "properties": json.loads(row[2]), "vector": row[3]} for row in nodes]
         except duckdb.Error as e:
             logger.error(f"Error fetching nodes: {e}")
             return []
