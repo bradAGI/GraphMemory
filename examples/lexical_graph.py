@@ -1,4 +1,4 @@
-from graphmemory import GraphMemory, Node
+from graphmemory import GraphMemory, Node, Edge
 from langchain.text_splitter import CharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
@@ -8,6 +8,8 @@ import requests
 r = requests.get(
     'https://en.wikipedia.org/w/api.php?action=query&format=json&titles=Hoover%20Dam&prop=extracts&explaintext')
 text = r.json()['query']['pages']['14308']['extract']
+
+print(text)
 
 text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
 texts = text_splitter.split_text(text)
@@ -19,16 +21,23 @@ graph_memory = GraphMemory(
     vector_length=model.get_sentence_embedding_dimension()
 )
 
+previous_node = None
+
 for text in texts:
     embedding = model.encode(text)
     embedding = [float(e) for e in embedding]
     node = Node(type="text", properties={"content": text}, vector=embedding)
     graph_memory.insert_node(node)
+    if previous_node:
+        edge = Edge(source_id=previous_node.id, target_id=node.id, relation="followed_by")
+        graph_memory.insert_edge(edge)
+    previous_node = node
+    
 
-query = "How many tourists per year visit the Hoover Dam?"
+query = "What was the issue with the naming controversy of the Hoover Dam?"
 query_embedding = model.encode(query)
 query_embedding = [float(e) for e in query_embedding]
-results = graph_memory.nearest_nodes(vector=query_embedding, limit=1)
+results = graph_memory.nearest_nodes(vector=query_embedding, limit=3)
 
 if results:
     response = client.chat.completions.create(
