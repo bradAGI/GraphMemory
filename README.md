@@ -1,3 +1,7 @@
+[![](https://dcbadge.limes.pink/api/server/https://discord.gg/DSS3DmStV8)](https://discord.gg/DSS3DmStV8)
+
+[☁️ Managed Cloud Version](https://rapidapi.com/graphmemory-graphmemory-default/api/graphmemory-graphrag-api-for-llms)
+
 # GraphMemory - GraphRAG Database
 
 ![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/9897dc2a-46c9-42e0-a8d3-2dcb1d93e6ae)
