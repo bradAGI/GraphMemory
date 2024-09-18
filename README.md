@@ -1,3 +1,8 @@
+<a href="https://rapidapi.com/graphmemory-graphmemory-default/api/graphmemory-graphrag-api-for-llms" target="_blank">
+	<img src="https://storage.googleapis.com/rapidapi-documentation/connect-on-rapidapi-dark.png" width="215" alt="Connect on RapidAPI">
+</a>
+
+
 [![](https://img.shields.io/badge/RapidAPI-Managed_Cloud_Version-blue?logo=rapid)](https://rapidapi.com/graphmemory-graphmemory-default/api/graphmemory-graphrag-api-for-llms)
 
 
