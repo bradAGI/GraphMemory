@@ -233,6 +233,20 @@ class TestGraphMemoryGetConnectedNodes(unittest.TestCase):
         self.assertEqual(len(connected_nodes), 1)
         self.assertEqual(connected_nodes[0].id, self.node2_id)
 
+    def test_get_nodes_vector_with_uuid(self):
+        node = Node(properties={"name": "vector_test"}, vector=[0.1, 0.2, 0.3])
+        node_id = self.db.insert_node(node)
+        self.assertIsInstance(node_id, uuid.UUID)
+        vector = self.db.get_nodes_vector(node_id)
+        self.assertEqual(len(vector), 3)
+        self.assertAlmostEqual(vector[0], 0.1, places=5)
+        self.assertAlmostEqual(vector[1], 0.2, places=5)
+        self.assertAlmostEqual(vector[2], 0.3, places=5)
+
+    def test_get_nodes_vector_nonexistent(self):
+        vector = self.db.get_nodes_vector(uuid.uuid4())
+        self.assertEqual(vector, [])
+
     def tearDown(self):
         self.db.conn.close()
 

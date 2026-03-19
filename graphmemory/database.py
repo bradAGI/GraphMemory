@@ -262,10 +262,10 @@ class GraphMemory:
             logger.error(f"Error fetching nodes: {e}")
             return []
 
-    def get_nodes_vector(self, node_id: int) -> List[float]:
+    def get_nodes_vector(self, node_id: uuid.UUID) -> List[float]:
         try:
             vector = self.conn.execute(
-                "SELECT vector FROM nodes WHERE id = ?;", (node_id,)).fetchone()
+                "SELECT vector FROM nodes WHERE id = ?;", (str(node_id),)).fetchone()
             return vector[0] if vector else []
         except duckdb.Error as e:
             logger.error(f"Error fetching vector: {e}")
