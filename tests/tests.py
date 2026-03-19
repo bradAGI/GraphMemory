@@ -1824,5 +1824,145 @@ class TestConcurrentCursorUsage(unittest.TestCase):
         db.close()
 
 
+class TestAlgorithms(unittest.TestCase):
+    """Tests for graphmemory.algorithms module."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+        # Build a small directed graph:
+        #   A -> B -> C
+        #   A -> D
+        #   D -> C
+        self.node_a = Node(properties={"name": "A"}, vector=[1.0, 0.0, 0.0])
+        self.node_b = Node(properties={"name": "B"}, vector=[0.0, 1.0, 0.0])
+        self.node_c = Node(properties={"name": "C"}, vector=[0.0, 0.0, 1.0])
+        self.node_d = Node(properties={"name": "D"}, vector=[1.0, 1.0, 0.0])
+
+        self.db.insert_node(self.node_a)
+        self.db.insert_node(self.node_b)
+        self.db.insert_node(self.node_c)
+        self.db.insert_node(self.node_d)
+
+        self.db.insert_edge(Edge(source_id=self.node_a.id, target_id=self.node_b.id, relation="knows"))
+        self.db.insert_edge(Edge(source_id=self.node_b.id, target_id=self.node_c.id, relation="knows"))
+        self.db.insert_edge(Edge(source_id=self.node_a.id, target_id=self.node_d.id, relation="knows"))
+        self.db.insert_edge(Edge(source_id=self.node_d.id, target_id=self.node_c.id, relation="knows"))
+
+    def test_to_networkx(self):
+        from graphmemory.algorithms import to_networkx
+        G = to_networkx(self.db)
+        self.assertEqual(len(G.nodes), 4)
+        self.assertEqual(len(G.edges), 4)
+        # Check node attributes
+        node_a_id = str(self.node_a.id)
+        self.assertEqual(G.nodes[node_a_id]["properties"]["name"], "A")
+        self.assertEqual(list(G.nodes[node_a_id]["vector"]), [1.0, 0.0, 0.0])
+
+    def test_to_networkx_bridge_method(self):
+        G = self.db.to_networkx()
+        self.assertEqual(len(G.nodes), 4)
+        self.assertEqual(len(G.edges), 4)
+
+    def test_to_networkx_edge_attributes(self):
+        from graphmemory.algorithms import to_networkx
+        G = to_networkx(self.db)
+        node_a_id = str(self.node_a.id)
+        node_b_id = str(self.node_b.id)
+        self.assertEqual(G.edges[node_a_id, node_b_id]["relation"], "knows")
+
+    def test_to_networkx_empty_graph(self):
+        from graphmemory.algorithms import to_networkx
+        empty_db = GraphMemory(database=":memory:", vector_length=3)
+        G = to_networkx(empty_db)
+        self.assertEqual(len(G.nodes), 0)
+        self.assertEqual(len(G.edges), 0)
+
+    def test_pagerank(self):
+        from graphmemory.algorithms import pagerank
+        scores = pagerank(self.db)
+        self.assertEqual(len(scores), 4)
+        # All scores should sum to ~1.0
+        self.assertAlmostEqual(sum(scores.values()), 1.0, places=5)
+        # C should have high rank (two incoming edges, no outgoing)
+        node_c_id = str(self.node_c.id)
+        node_a_id = str(self.node_a.id)
+        self.assertGreater(scores[node_c_id], scores[node_a_id])
+
+    def test_pagerank_custom_alpha(self):
+        from graphmemory.algorithms import pagerank
+        scores = pagerank(self.db, alpha=0.5)
+        self.assertEqual(len(scores), 4)
+        self.assertAlmostEqual(sum(scores.values()), 1.0, places=5)
+
+    def test_betweenness_centrality(self):
+        from graphmemory.algorithms import betweenness_centrality
+        scores = betweenness_centrality(self.db)
+        self.assertEqual(len(scores), 4)
+        # All values should be between 0 and 1 (normalized)
+        for score in scores.values():
+            self.assertGreaterEqual(score, 0.0)
+            self.assertLessEqual(score, 1.0)
+
+    def test_betweenness_centrality_unnormalized(self):
+        from graphmemory.algorithms import betweenness_centrality
+        scores = betweenness_centrality(self.db, normalized=False)
+        self.assertEqual(len(scores), 4)
+        for score in scores.values():
+            self.assertGreaterEqual(score, 0.0)
+
+    def test_degree_distribution(self):
+        from graphmemory.algorithms import degree_distribution
+        dist = degree_distribution(self.db)
+        self.assertEqual(len(dist), 4)
+
+        node_a_id = str(self.node_a.id)
+        node_c_id = str(self.node_c.id)
+
+        # A has 0 in, 2 out
+        self.assertEqual(dist[node_a_id]["in_degree"], 0)
+        self.assertEqual(dist[node_a_id]["out_degree"], 2)
+        self.assertEqual(dist[node_a_id]["total_degree"], 2)
+
+        # C has 2 in, 0 out
+        self.assertEqual(dist[node_c_id]["in_degree"], 2)
+        self.assertEqual(dist[node_c_id]["out_degree"], 0)
+        self.assertEqual(dist[node_c_id]["total_degree"], 2)
+
+    def test_connected_components_single(self):
+        from graphmemory.algorithms import connected_components
+        components = connected_components(self.db)
+        # All 4 nodes are connected
+        self.assertEqual(len(components), 1)
+        self.assertEqual(len(components[0]), 4)
+
+    def test_connected_components_multiple(self):
+        from graphmemory.algorithms import connected_components
+        # Create a separate disconnected graph
+        db2 = GraphMemory(database=":memory:", vector_length=3)
+        n1 = Node(properties={"name": "X"}, vector=[1.0, 0.0, 0.0])
+        n2 = Node(properties={"name": "Y"}, vector=[0.0, 1.0, 0.0])
+        n3 = Node(properties={"name": "Z"}, vector=[0.0, 0.0, 1.0])
+        db2.insert_node(n1)
+        db2.insert_node(n2)
+        db2.insert_node(n3)
+        # Only connect X -> Y, Z is isolated
+        db2.insert_edge(Edge(source_id=n1.id, target_id=n2.id, relation="linked"))
+
+        components = connected_components(db2)
+        self.assertEqual(len(components), 2)
+        # Largest first
+        self.assertEqual(len(components[0]), 2)
+        self.assertEqual(len(components[1]), 1)
+        self.assertIn(str(n3.id), components[1])
+
+    def test_algorithms_empty_graph(self):
+        from graphmemory.algorithms import pagerank, betweenness_centrality, degree_distribution, connected_components
+        empty_db = GraphMemory(database=":memory:", vector_length=3)
+        self.assertEqual(pagerank(empty_db), {})
+        self.assertEqual(betweenness_centrality(empty_db), {})
+        self.assertEqual(degree_distribution(empty_db), {})
+        self.assertEqual(connected_components(empty_db), [])
+
+
 if __name__ == '__main__':
     unittest.main()
