@@ -1,7 +1,14 @@
 import uuid
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class MergeStrategy(str, Enum):
+    REPLACE = "replace"
+    UPDATE = "update"
+    KEEP = "keep"
 
 
 class GraphEntity(BaseModel):
@@ -54,3 +61,13 @@ class RetrievalResult(BaseModel):
     token_estimate: int = Field(default=0, description="Estimated token count of context_text")
     seed_node_count: int = Field(default=0, description="Number of initial nodes found by search")
     total_node_count: int = Field(default=0, description="Total nodes after graph expansion")
+
+
+class MergeResult(BaseModel):
+    node: Node
+    created: bool = Field(description="True if inserted, False if updated")
+
+
+class EdgeMergeResult(BaseModel):
+    edge: Edge
+    created: bool = Field(description="True if inserted, False if updated")

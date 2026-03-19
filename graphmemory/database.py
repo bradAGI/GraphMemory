@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from typing import Any, Dict, List, Union, List
 
-from graphmemory.models import Edge, NearestNode, Node, RetrievalContext, RetrievalResult, SearchResult, TraversalResult
+from graphmemory.models import Edge, EdgeMergeResult, MergeResult, MergeStrategy, NearestNode, Node, RetrievalContext, RetrievalResult, SearchResult, TraversalResult
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +337,223 @@ class GraphMemory:
                     f"DELETE FROM edges WHERE id IN ({placeholders});", id_strs)
         except duckdb.Error as e:
             logger.error(f"Error during bulk delete edges: {e}")
+
+    def _find_matching_node(self, cur, node: Node, match_keys: list[str], match_type: bool) -> Node | None:
+        """Find an existing node matching the given property keys and optional type."""
+        where_parts: list[str] = []
+        params: list = []
+        if match_type and node.type is not None:
+            where_parts.append("type = ?")
+            params.append(node.type)
+        for key in match_keys:
+            if not self._VALID_ATTRIBUTE_RE.match(key):
+                raise ValueError(f"Invalid match key: {key!r}")
+            value = (node.properties or {}).get(key)
+            if value is None:
+                where_parts.append(f"json_extract(properties, '$.{key}') IS NULL")
+            else:
+                where_parts.append(f"json_extract(properties, '$.{key}') = ?")
+                params.append(json.dumps(value))
+        if not where_parts:
+            return None
+        query = "SELECT id, type, properties, vector FROM nodes WHERE " + " AND ".join(where_parts) + " LIMIT 1;"
+        row = cur.execute(query, params).fetchone()
+        if row:
+            return Node(id=row[0], type=row[1], properties=json.loads(row[2]), vector=row[3])
+        return None
+
+    @staticmethod
+    def _merge_properties(existing: dict, incoming: dict, strategy: MergeStrategy) -> dict:
+        """Apply the merge strategy to combine existing and incoming properties."""
+        if strategy == MergeStrategy.REPLACE:
+            return incoming or {}
+        elif strategy == MergeStrategy.UPDATE:
+            return {**(existing or {}), **(incoming or {})}
+        elif strategy == MergeStrategy.KEEP:
+            return existing or {}
+        return incoming or {}
+
+    @with_retry()
+    def merge_node(self, node: Node, match_keys: list[str],
+                   match_type: bool = True,
+                   strategy: MergeStrategy = MergeStrategy.UPDATE,
+                   update_vector: bool = True) -> MergeResult:
+        """Insert a node or update it if a match is found by property keys.
+
+        Args:
+            node: The node to merge.
+            match_keys: Property names to match on (e.g. ["name"]).
+            match_type: Also require node.type to match (default True).
+            strategy: How to merge properties (REPLACE, UPDATE, KEEP).
+            update_vector: Whether to replace the vector on match.
+
+        Returns:
+            MergeResult with the resulting node and whether it was created.
+        """
+        if not match_keys:
+            raise ValueError("match_keys must not be empty")
+        for key in match_keys:
+            if not self._VALID_ATTRIBUTE_RE.match(key):
+                raise ValueError(f"Invalid match key: {key!r}")
+        if node.vector and not self._validate_vector(node.vector):
+            raise ValueError("Invalid vector: must be a list of floats with correct length")
+
+        try:
+            with self.transaction():
+                cur = self.cursor()
+                existing = self._find_matching_node(cur, node, match_keys, match_type)
+                if existing:
+                    merged_props = self._merge_properties(existing.properties, node.properties, strategy)
+                    vector = node.vector if update_vector and node.vector else existing.vector
+                    node_type = node.type if node.type is not None else existing.type
+                    cur.execute(
+                        "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
+                        (node_type, json.dumps(merged_props), vector, str(existing.id))
+                    )
+                    self._fts_dirty = True
+                    result_node = Node(id=existing.id, type=node_type, properties=merged_props, vector=vector)
+                    return MergeResult(node=result_node, created=False)
+                else:
+                    result = cur.execute(
+                        "INSERT INTO nodes (id, type, properties, vector) VALUES (?, ?, ?, ?) RETURNING id;",
+                        (str(node.id), node.type, json.dumps(node.properties), node.vector if node.vector else [0.0] * self.vector_length)
+                    ).fetchone()
+                    self._fts_dirty = True
+                    result_node = Node(id=result[0], type=node.type, properties=node.properties, vector=node.vector)
+                    return MergeResult(node=result_node, created=True)
+        except duckdb.Error as e:
+            logger.error(f"Error during merge node: {e}")
+            raise
+
+    @with_retry()
+    def bulk_merge_nodes(self, nodes: list[Node], match_keys: list[str],
+                         match_type: bool = True,
+                         strategy: MergeStrategy = MergeStrategy.UPDATE,
+                         update_vector: bool = True) -> list[MergeResult]:
+        """Merge multiple nodes, inserting new ones and updating matches.
+
+        Runs in a single transaction for atomicity.
+        """
+        if not match_keys:
+            raise ValueError("match_keys must not be empty")
+        for key in match_keys:
+            if not self._VALID_ATTRIBUTE_RE.match(key):
+                raise ValueError(f"Invalid match key: {key!r}")
+
+        results: list[MergeResult] = []
+        try:
+            with self.transaction():
+                cur = self.cursor()
+                for node in nodes:
+                    if node.vector and not self._validate_vector(node.vector):
+                        logger.error(f"Invalid vector for node, skipping: {node.id}")
+                        continue
+                    existing = self._find_matching_node(cur, node, match_keys, match_type)
+                    if existing:
+                        merged_props = self._merge_properties(existing.properties, node.properties, strategy)
+                        vector = node.vector if update_vector and node.vector else existing.vector
+                        node_type = node.type if node.type is not None else existing.type
+                        cur.execute(
+                            "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
+                            (node_type, json.dumps(merged_props), vector, str(existing.id))
+                        )
+                        result_node = Node(id=existing.id, type=node_type, properties=merged_props, vector=vector)
+                        results.append(MergeResult(node=result_node, created=False))
+                    else:
+                        result = cur.execute(
+                            "INSERT INTO nodes (id, type, properties, vector) VALUES (?, ?, ?, ?) RETURNING id;",
+                            (str(node.id), node.type, json.dumps(node.properties), node.vector if node.vector else [0.0] * self.vector_length)
+                        ).fetchone()
+                        result_node = Node(id=result[0], type=node.type, properties=node.properties, vector=node.vector)
+                        results.append(MergeResult(node=result_node, created=True))
+                if results:
+                    self._fts_dirty = True
+                return results
+        except duckdb.Error as e:
+            logger.error(f"Error during bulk merge nodes: {e}")
+            raise
+
+    def _find_matching_edge(self, cur, edge: Edge) -> Edge | None:
+        """Find an existing edge matching (source_id, target_id, relation)."""
+        row = cur.execute(
+            "SELECT id, source_id, target_id, relation, weight FROM edges WHERE source_id = ? AND target_id = ? AND relation = ? LIMIT 1;",
+            (str(edge.source_id), str(edge.target_id), edge.relation)
+        ).fetchone()
+        if row:
+            return Edge(id=row[0], source_id=row[1], target_id=row[2], relation=row[3], weight=row[4])
+        return None
+
+    @with_retry()
+    def merge_edge(self, edge: Edge, update_weight: bool = True) -> EdgeMergeResult:
+        """Insert an edge or update it if a match on (source_id, target_id, relation) exists.
+
+        Args:
+            edge: The edge to merge.
+            update_weight: Whether to update the weight on match.
+
+        Returns:
+            EdgeMergeResult with the resulting edge and whether it was created.
+        """
+        try:
+            with self.transaction():
+                cur = self.cursor()
+                source_exists = cur.execute("SELECT 1 FROM nodes WHERE id = ?", (str(edge.source_id),)).fetchone()
+                target_exists = cur.execute("SELECT 1 FROM nodes WHERE id = ?", (str(edge.target_id),)).fetchone()
+                if not source_exists or not target_exists:
+                    raise ValueError("Source or target node does not exist.")
+
+                existing = self._find_matching_edge(cur, edge)
+                if existing:
+                    if update_weight and edge.weight is not None:
+                        cur.execute("UPDATE edges SET weight = ? WHERE id = ?;", (edge.weight, str(existing.id)))
+                        result_edge = Edge(id=existing.id, source_id=existing.source_id, target_id=existing.target_id, relation=existing.relation, weight=edge.weight)
+                    else:
+                        result_edge = existing
+                    return EdgeMergeResult(edge=result_edge, created=False)
+                else:
+                    cur.execute(
+                        "INSERT INTO edges (id, source_id, target_id, relation, weight) VALUES (?, ?, ?, ?, ?);",
+                        (str(edge.id), str(edge.source_id), str(edge.target_id), edge.relation, edge.weight)
+                    )
+                    return EdgeMergeResult(edge=edge, created=True)
+        except duckdb.Error as e:
+            logger.error(f"Error during merge edge: {e}")
+            raise
+
+    @with_retry()
+    def bulk_merge_edges(self, edges: list[Edge], update_weight: bool = True) -> list[EdgeMergeResult]:
+        """Merge multiple edges, inserting new ones and updating matches.
+
+        Deduplicates on (source_id, target_id, relation). Runs in a single transaction.
+        """
+        results: list[EdgeMergeResult] = []
+        try:
+            with self.transaction():
+                cur = self.cursor()
+                for edge in edges:
+                    source_exists = cur.execute("SELECT 1 FROM nodes WHERE id = ?", (str(edge.source_id),)).fetchone()
+                    target_exists = cur.execute("SELECT 1 FROM nodes WHERE id = ?", (str(edge.target_id),)).fetchone()
+                    if not source_exists or not target_exists:
+                        logger.error(f"Skipping edge {edge.id}: source or target node does not exist.")
+                        continue
+                    existing = self._find_matching_edge(cur, edge)
+                    if existing:
+                        if update_weight and edge.weight is not None:
+                            cur.execute("UPDATE edges SET weight = ? WHERE id = ?;", (edge.weight, str(existing.id)))
+                            result_edge = Edge(id=existing.id, source_id=existing.source_id, target_id=existing.target_id, relation=existing.relation, weight=edge.weight)
+                        else:
+                            result_edge = existing
+                        results.append(EdgeMergeResult(edge=result_edge, created=False))
+                    else:
+                        cur.execute(
+                            "INSERT INTO edges (id, source_id, target_id, relation, weight) VALUES (?, ?, ?, ?, ?);",
+                            (str(edge.id), str(edge.source_id), str(edge.target_id), edge.relation, edge.weight)
+                        )
+                        results.append(EdgeMergeResult(edge=edge, created=True))
+                return results
+        except duckdb.Error as e:
+            logger.error(f"Error during bulk merge edges: {e}")
+            raise
 
     @with_retry()
     def delete_edge(self, source_id: uuid.UUID, target_id: uuid.UUID):

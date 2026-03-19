@@ -11,7 +11,7 @@ import unittest
 from pydantic import ValidationError
 
 from graphmemory.database import GraphMemory
-from graphmemory.models import Edge, Node
+from graphmemory.models import Edge, EdgeMergeResult, MergeResult, MergeStrategy, Node
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
@@ -2304,6 +2304,267 @@ class TestContextAssembly(unittest.TestCase):
     def test_estimate_tokens(self):
         text = "a" * 400
         self.assertEqual(GraphMemory._estimate_tokens(text), 100)
+
+
+class TestMergeNode(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+
+    def tearDown(self):
+        self.db.close()
+
+    def _make_node(self, name, node_type="Person", vector=None):
+        return Node(type=node_type, properties={"name": name}, vector=vector or [1.0, 0.0, 0.0])
+
+    def test_merge_node_insert_new(self):
+        node = self._make_node("Alice")
+        result = self.db.merge_node(node, match_keys=["name"])
+        self.assertTrue(result.created)
+        self.assertEqual(result.node.properties["name"], "Alice")
+        self.assertEqual(len(self.db.nodes_to_json()), 1)
+
+    def test_merge_node_update_existing(self):
+        node1 = self._make_node("Alice")
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice", "age": 30}, vector=[0.5, 0.5, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"])
+        self.assertFalse(result.created)
+        self.assertEqual(result.node.properties["name"], "Alice")
+        self.assertEqual(result.node.properties["age"], 30)
+        self.assertEqual(result.node.id, node1.id)
+        self.assertEqual(len(self.db.nodes_to_json()), 1)
+
+    def test_merge_node_replace_strategy(self):
+        node1 = self._make_node("Alice")
+        node1.properties["age"] = 25
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], strategy=MergeStrategy.REPLACE)
+        self.assertFalse(result.created)
+        self.assertNotIn("age", result.node.properties)
+        self.assertEqual(result.node.properties["role"], "engineer")
+
+    def test_merge_node_update_strategy(self):
+        node1 = self._make_node("Alice")
+        node1.properties["age"] = 25
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], strategy=MergeStrategy.UPDATE)
+        self.assertFalse(result.created)
+        self.assertEqual(result.node.properties["age"], 25)
+        self.assertEqual(result.node.properties["role"], "engineer")
+
+    def test_merge_node_keep_strategy(self):
+        node1 = self._make_node("Alice")
+        node1.properties["age"] = 25
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], strategy=MergeStrategy.KEEP)
+        self.assertFalse(result.created)
+        self.assertEqual(result.node.properties["age"], 25)
+        self.assertNotIn("role", result.node.properties)
+
+    def test_merge_node_vector_update_true(self):
+        node1 = self._make_node("Alice", vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice"}, vector=[0.0, 1.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], update_vector=True)
+        self.assertEqual(result.node.vector, [0.0, 1.0, 0.0])
+
+    def test_merge_node_vector_update_false(self):
+        node1 = self._make_node("Alice", vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice"}, vector=[0.0, 1.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], update_vector=False)
+        self.assertEqual(result.node.vector, [1.0, 0.0, 0.0])
+
+    def test_merge_node_match_type_false(self):
+        node1 = Node(type="Employee", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], match_type=False)
+        self.assertFalse(result.created)
+        self.assertEqual(result.node.id, node1.id)
+
+    def test_merge_node_match_type_true_no_match(self):
+        node1 = Node(type="Employee", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name"], match_type=True)
+        self.assertTrue(result.created)
+        self.assertEqual(len(self.db.nodes_to_json()), 2)
+
+    def test_merge_node_multiple_match_keys(self):
+        node1 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node1)
+        node2 = Node(type="Person", properties={"name": "Alice", "role": "manager"}, vector=[1.0, 0.0, 0.0])
+        result = self.db.merge_node(node2, match_keys=["name", "role"])
+        self.assertTrue(result.created)
+        self.assertEqual(len(self.db.nodes_to_json()), 2)
+
+    def test_merge_node_invalid_match_key(self):
+        node = self._make_node("Alice")
+        with self.assertRaises(ValueError):
+            self.db.merge_node(node, match_keys=["name; DROP TABLE"])
+
+    def test_merge_node_empty_match_keys(self):
+        node = self._make_node("Alice")
+        with self.assertRaises(ValueError):
+            self.db.merge_node(node, match_keys=[])
+
+    def test_merge_node_sets_fts_dirty(self):
+        self.db._fts_dirty = False
+        node = self._make_node("Alice")
+        self.db.merge_node(node, match_keys=["name"])
+        self.assertTrue(self.db._fts_dirty)
+
+
+class TestBulkMergeNodes(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_bulk_merge_mixed(self):
+        existing = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(existing)
+        nodes = [
+            Node(type="Person", properties={"name": "Alice", "age": 30}, vector=[1.0, 0.0, 0.0]),
+            Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]),
+        ]
+        results = self.db.bulk_merge_nodes(nodes, match_keys=["name"])
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[0].created)
+        self.assertTrue(results[1].created)
+        self.assertEqual(results[0].node.properties["age"], 30)
+        self.assertEqual(len(self.db.nodes_to_json()), 2)
+
+    def test_bulk_merge_all_new(self):
+        nodes = [
+            Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0]),
+            Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]),
+        ]
+        results = self.db.bulk_merge_nodes(nodes, match_keys=["name"])
+        self.assertTrue(all(r.created for r in results))
+
+    def test_bulk_merge_all_existing(self):
+        self.db.insert_node(Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0]))
+        self.db.insert_node(Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]))
+        nodes = [
+            Node(type="Person", properties={"name": "Alice", "age": 30}, vector=[1.0, 0.0, 0.0]),
+            Node(type="Person", properties={"name": "Bob", "age": 25}, vector=[0.0, 1.0, 0.0]),
+        ]
+        results = self.db.bulk_merge_nodes(nodes, match_keys=["name"])
+        self.assertFalse(any(r.created for r in results))
+        self.assertEqual(len(self.db.nodes_to_json()), 2)
+
+    def test_bulk_merge_empty(self):
+        results = self.db.bulk_merge_nodes([], match_keys=["name"])
+        self.assertEqual(results, [])
+
+    def test_bulk_merge_idempotent(self):
+        nodes = [
+            Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0]),
+            Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]),
+        ]
+        self.db.bulk_merge_nodes(nodes, match_keys=["name"])
+        self.db.bulk_merge_nodes(nodes, match_keys=["name"])
+        self.assertEqual(len(self.db.nodes_to_json()), 2)
+
+
+class TestMergeEdge(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+        self.alice = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.bob = Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0])
+        self.db.insert_node(self.alice)
+        self.db.insert_node(self.bob)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_merge_edge_insert_new(self):
+        edge = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=1.0)
+        result = self.db.merge_edge(edge)
+        self.assertTrue(result.created)
+        self.assertEqual(len(self.db.edges_to_json()), 1)
+
+    def test_merge_edge_update_existing(self):
+        edge1 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=1.0)
+        self.db.insert_edge(edge1)
+        edge2 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=5.0)
+        result = self.db.merge_edge(edge2)
+        self.assertFalse(result.created)
+        self.assertEqual(result.edge.weight, 5.0)
+        self.assertEqual(len(self.db.edges_to_json()), 1)
+
+    def test_merge_edge_keep_weight(self):
+        edge1 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=1.0)
+        self.db.insert_edge(edge1)
+        edge2 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=5.0)
+        result = self.db.merge_edge(edge2, update_weight=False)
+        self.assertFalse(result.created)
+        self.assertEqual(result.edge.weight, 1.0)
+
+    def test_merge_edge_different_relation_creates_new(self):
+        edge1 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=1.0)
+        self.db.insert_edge(edge1)
+        edge2 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="works_with", weight=2.0)
+        result = self.db.merge_edge(edge2)
+        self.assertTrue(result.created)
+        self.assertEqual(len(self.db.edges_to_json()), 2)
+
+    def test_merge_edge_nonexistent_nodes(self):
+        fake_id = uuid.uuid4()
+        edge = Edge(source_id=fake_id, target_id=self.bob.id, relation="knows")
+        with self.assertRaises(ValueError):
+            self.db.merge_edge(edge)
+
+
+class TestBulkMergeEdges(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+        self.alice = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.bob = Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0])
+        self.carol = Node(type="Person", properties={"name": "Carol"}, vector=[0.0, 0.0, 1.0])
+        self.db.insert_node(self.alice)
+        self.db.insert_node(self.bob)
+        self.db.insert_node(self.carol)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_bulk_merge_edges_mixed(self):
+        edge1 = Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=1.0)
+        self.db.insert_edge(edge1)
+        edges = [
+            Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows", weight=2.0),
+            Edge(source_id=self.alice.id, target_id=self.carol.id, relation="knows", weight=3.0),
+        ]
+        results = self.db.bulk_merge_edges(edges)
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[0].created)
+        self.assertTrue(results[1].created)
+        self.assertEqual(results[0].edge.weight, 2.0)
+        self.assertEqual(len(self.db.edges_to_json()), 2)
+
+    def test_bulk_merge_edges_empty(self):
+        results = self.db.bulk_merge_edges([])
+        self.assertEqual(results, [])
+
+    def test_bulk_merge_edges_idempotent(self):
+        edges = [
+            Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows"),
+            Edge(source_id=self.bob.id, target_id=self.carol.id, relation="knows"),
+        ]
+        self.db.bulk_merge_edges(edges)
+        self.db.bulk_merge_edges(edges)
+        self.assertEqual(len(self.db.edges_to_json()), 2)
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from graphmemory.models import Edge, Node
+from graphmemory.models import Edge, EdgeMergeResult, MergeResult, MergeStrategy, Node
 
 if TYPE_CHECKING:
     from graphmemory.database import GraphMemory
@@ -244,3 +244,47 @@ def extract_and_store(
         "Extracted and stored %d nodes and %d edges.", len(inserted_nodes), len(edges)
     )
     return inserted_nodes, edges
+
+
+def extract_and_merge(
+    graph: GraphMemory,
+    text: str,
+    match_keys: list[str] | None = None,
+    match_type: bool = True,
+    strategy: MergeStrategy = MergeStrategy.UPDATE,
+    sentences: list[str] | None = None,
+) -> tuple[list[MergeResult], list[EdgeMergeResult]]:
+    """Extract nodes and edges from text, merging with existing graph data.
+
+    Unlike :func:`extract_and_store`, this deduplicates against existing nodes
+    by matching on the specified property keys, and deduplicates edges on
+    ``(source_id, target_id, relation)``.
+
+    Args:
+        graph: A :class:`~graphmemory.database.GraphMemory` instance.
+        text: The unstructured text to process.
+        match_keys: Property names to match nodes on (default ``["name"]``).
+        match_type: Also require ``node.type`` to match (default ``True``).
+        strategy: How to merge properties on match.
+        sentences: Optional pre-split sentences.
+
+    Returns:
+        A ``(node_results, edge_results)`` tuple of merge results.
+    """
+    if match_keys is None:
+        match_keys = ["name"]
+
+    nodes, edges = extract(text, sentences=sentences)
+
+    node_results = graph.bulk_merge_nodes(
+        nodes, match_keys=match_keys, match_type=match_type, strategy=strategy,
+    ) if nodes else []
+
+    edge_results = graph.bulk_merge_edges(edges) if edges else []
+
+    logger.info(
+        "Extracted and merged %d nodes and %d edges.",
+        len(node_results),
+        len(edge_results),
+    )
+    return node_results, edge_results
