@@ -20,6 +20,8 @@ Vector embeddings can be created using [sentence-transformers](https://www.sbert
 - **Vector Similarity Search** — HNSW-indexed nearest neighbor search with L2, cosine, and inner product distance metrics
 - **Full-Text Search** — BM25-scored text search across node properties
 - **Hybrid Search** — Combined vector + text search with configurable weights
+- **GraphRAG Retrieval** — Full retrieval pipeline: hybrid search → graph expansion → context assembly → LLM Q&A
+- **Merge / Upsert** — Insert-or-update nodes by property match keys with configurable merge strategies (REPLACE, UPDATE, KEEP); edge deduplication on (source, target, relation)
 - **DSPy Extraction** — Automatic entity and relationship extraction from unstructured text using DSPy typed predictors
 - **Graph Algorithms** — PageRank, betweenness centrality, degree distribution, and connected components via NetworkX
 - **Query Builder** — Fluent, composable, parameterized query API with traversal support
@@ -90,6 +92,70 @@ results = graph.query().match(type="Person").order_by("name").limit(10).offset(0
 edges = graph.query().match(type="Person").edges().execute()
 ```
 
+### Merge / Upsert
+
+Insert nodes and edges without creating duplicates. Nodes are matched by configurable property keys; edges are deduplicated on `(source_id, target_id, relation)`.
+
+```python
+from graphmemory import GraphMemory, Node, Edge, MergeStrategy
+
+graph = GraphMemory(vector_length=3)
+
+# First insert
+alice = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+result = graph.merge_node(alice, match_keys=["name"])
+print(result.created)  # True — inserted
+
+# Second merge with new properties — updates instead of duplicating
+alice_v2 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[0.9, 0.1, 0.0])
+result = graph.merge_node(alice_v2, match_keys=["name"], strategy=MergeStrategy.UPDATE)
+print(result.created)      # False — updated existing
+print(result.node.properties)  # {"name": "Alice", "role": "engineer"}
+
+# Bulk merge
+nodes = [
+    Node(type="Person", properties={"name": "Alice", "age": 30}, vector=[1.0, 0.0, 0.0]),
+    Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]),
+]
+results = graph.bulk_merge_nodes(nodes, match_keys=["name"])
+
+# Edge merge — dedup on (source, target, relation)
+edge = Edge(source_id=alice.id, target_id=results[1].node.id, relation="knows", weight=1.0)
+edge_result = graph.merge_edge(edge)
+```
+
+**Merge strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `MergeStrategy.UPDATE` | Shallow merge: existing properties are preserved, incoming properties are added/overwritten (default) |
+| `MergeStrategy.REPLACE` | Incoming properties fully replace existing properties |
+| `MergeStrategy.KEEP` | Existing properties are kept unchanged; only new nodes are inserted |
+
+### GraphRAG Retrieval
+
+Full retrieval pipeline: hybrid search → multi-hop graph expansion → token-aware context assembly → optional LLM generation.
+
+```python
+# Retrieve context for a query
+result = graph.retrieve(
+    query="Who leads ML at Acme?",
+    query_vector=embedding,
+    max_hops=2,
+    max_tokens=4000
+)
+print(result.context_text)     # Prompt-ready context string
+print(result.token_estimate)   # Estimated token count
+
+# End-to-end Q&A with an LLM
+answer = graph.ask(
+    query="Who leads ML at Acme?",
+    query_vector=embedding,
+    llm_callable=lambda system, user: my_llm(system, user)
+)
+print(answer["answer"])
+```
+
 ### DSPy Extraction
 
 The `graphmemory.extraction` module uses [DSPy](https://dspy.ai/) typed predictors to automatically extract entities (nodes) and relationships (edges) from unstructured text. Requires the `extraction` optional dependency.
@@ -124,6 +190,7 @@ Available functions:
 | `extract_edges(text, nodes, sentences=None) -> list[Edge]` | Extract relationships between known nodes. |
 | `extract(text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract both nodes and edges in one call. |
 | `extract_and_store(graph, text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract and insert into a GraphMemory instance. |
+| `extract_and_merge(graph, text, match_keys=["name"], ...) -> tuple[list[MergeResult], list[EdgeMergeResult]]` | Extract and merge into a GraphMemory instance (deduplicates against existing data). |
 
 ### Graph Algorithms
 
@@ -358,6 +425,34 @@ TraversalResult(
 )
 ```
 
+### MergeResult
+```python
+MergeResult(
+    node: Node,     # The resulting node (inserted or updated)
+    created: bool   # True if inserted, False if updated
+)
+```
+
+### EdgeMergeResult
+```python
+EdgeMergeResult(
+    edge: Edge,     # The resulting edge (inserted or updated)
+    created: bool   # True if inserted, False if updated
+)
+```
+
+### RetrievalResult
+```python
+RetrievalResult(
+    query: str,                          # The original query
+    contexts: list[RetrievalContext],     # Retrieved context items ordered by relevance
+    context_text: str,                   # Assembled prompt-ready context string
+    token_estimate: int,                 # Estimated token count
+    seed_node_count: int,                # Initial nodes found by search
+    total_node_count: int                # Total nodes after graph expansion
+)
+```
+
 ## GraphMemory API Reference
 
 ### Initialization & Connection
@@ -382,6 +477,8 @@ TraversalResult(
 | `nodes_by_attribute(attribute, value, limit=None, offset=None) -> list[Node]` | Query nodes by a property key-value pair. |
 | `get_nodes_vector(node_id: uuid.UUID) -> list[float]` | Retrieve the vector of a node. |
 | `nodes_to_json(limit=None, offset=None) -> list[dict]` | Export all nodes as JSON. |
+| `merge_node(node, match_keys, match_type=True, strategy=MergeStrategy.UPDATE, update_vector=True) -> MergeResult` | Insert or update a node matched by property keys. |
+| `bulk_merge_nodes(nodes, match_keys, ...) -> list[MergeResult]` | Bulk insert-or-update nodes. |
 
 ### Edge Operations
 
@@ -396,6 +493,8 @@ TraversalResult(
 | `delete_edge(source_id: uuid.UUID, target_id: uuid.UUID)` | Delete an edge by source and target node IDs. |
 | `bulk_delete_edges(edge_ids: list[uuid.UUID])` | Bulk delete multiple edges. |
 | `edges_to_json(limit=None, offset=None) -> list[dict]` | Export all edges as JSON. |
+| `merge_edge(edge, update_weight=True) -> EdgeMergeResult` | Insert or update an edge matched by (source_id, target_id, relation). |
+| `bulk_merge_edges(edges, update_weight=True) -> list[EdgeMergeResult]` | Bulk insert-or-update edges. |
 
 ### Search & Similarity
 
@@ -406,6 +505,13 @@ TraversalResult(
 | `hybrid_search(query_text, query_vector, limit=10, text_weight=0.5, vector_weight=0.5) -> list[SearchResult]` | Combined text + vector search with configurable weights. |
 | `create_index()` | Create an HNSW index on node vectors for faster search. |
 | `set_vector_length(vector_length)` | Set the vector dimension for the database. |
+
+### Retrieval & Q&A
+
+| Method | Description |
+|--------|-------------|
+| `retrieve(query, query_vector, max_hops=2, max_tokens=4000, ...) -> RetrievalResult` | Full GraphRAG pipeline: hybrid search → graph expansion → context assembly. |
+| `ask(query, query_vector, llm_callable=None, ...) -> dict` | End-to-end Q&A: retrieval + LLM generation. |
 
 ### Graph Traversal
 
@@ -436,11 +542,11 @@ See the `examples/` directory for complete usage examples:
 - **`dspy_example_typed_pred.py`** — Knowledge graph extraction from unstructured text using DSPy
 
 ## Testing
-Unit tests are provided in `tests/tests.py`.
+265 unit tests covering all functionality in `tests/tests.py`.
 
 ### Running Tests
 ```sh
-python3 -m unittest discover -s tests
+python3 -m pytest tests/tests.py -v
 ```
 
 ## License
