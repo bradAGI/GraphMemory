@@ -71,3 +71,9 @@ class MergeResult(BaseModel):
 class EdgeMergeResult(BaseModel):
     edge: Edge
     created: bool = Field(description="True if inserted, False if updated")
+
+
+class DuplicateCluster(BaseModel):
+    """A cluster of nodes identified as likely duplicates."""
+    survivor: Node
+    merged: list[Node] = Field(default_factory=list)

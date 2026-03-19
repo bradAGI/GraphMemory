@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from typing import Any, Dict, List, Union, List
 
-from graphmemory.models import Edge, EdgeMergeResult, MergeResult, MergeStrategy, NearestNode, Node, RetrievalContext, RetrievalResult, SearchResult, TraversalResult
+from graphmemory.models import DuplicateCluster, Edge, EdgeMergeResult, MergeResult, MergeStrategy, NearestNode, Node, RetrievalContext, RetrievalResult, SearchResult, TraversalResult
 
 logger = logging.getLogger(__name__)
 
@@ -338,25 +338,71 @@ class GraphMemory:
         except duckdb.Error as e:
             logger.error(f"Error during bulk delete edges: {e}")
 
-    def _find_matching_node(self, cur, node: Node, match_keys: list[str], match_type: bool) -> Node | None:
-        """Find an existing node matching the given property keys and optional type."""
+    def _find_matching_node(
+        self, cur, node: Node, match_keys: list[str], match_type: bool,
+        similarity_threshold: float = 1.0,
+        vector_threshold: float | None = None,
+    ) -> Node | None:
+        """Find an existing node matching the given property keys and optional type.
+
+        When ``similarity_threshold`` is 1.0 (default), matching is exact.
+        Lower values enable fuzzy matching via DuckDB's ``jaro_winkler_similarity``.
+        When ``vector_threshold`` is set and the node has a vector, candidates must
+        also have a cosine distance within that threshold.
+        """
+        fuzzy = similarity_threshold < 1.0
+
+        # Separate param lists for SELECT expressions vs WHERE clauses,
+        # since DuckDB binds positional params in statement order.
+        select_extra: list[str] = []
+        select_params: list = []
         where_parts: list[str] = []
-        params: list = []
+        where_params: list = []
+
         if match_type and node.type is not None:
             where_parts.append("type = ?")
-            params.append(node.type)
+            where_params.append(node.type)
+
         for key in match_keys:
             if not self._VALID_ATTRIBUTE_RE.match(key):
                 raise ValueError(f"Invalid match key: {key!r}")
             value = (node.properties or {}).get(key)
             if value is None:
                 where_parts.append(f"json_extract(properties, '$.{key}') IS NULL")
+            elif fuzzy and isinstance(value, str):
+                alias = f"sim_{key}"
+                select_extra.append(
+                    f"jaro_winkler_similarity(json_extract_string(properties, '$.{key}'), ?) AS {alias}"
+                )
+                select_params.append(value)
+                where_parts.append(f"{alias} >= ?")
+                where_params.append(similarity_threshold)
             else:
                 where_parts.append(f"json_extract(properties, '$.{key}') = ?")
-                params.append(json.dumps(value))
-        if not where_parts:
+                where_params.append(json.dumps(value))
+
+        if vector_threshold is not None and node.vector:
+            where_parts.append(f"array_cosine_distance(vector, CAST(? AS FLOAT[{self.vector_length}])) <= ?")
+            where_params.extend([node.vector, vector_threshold])
+
+        if not where_parts and not select_extra:
             return None
-        query = "SELECT id, type, properties, vector FROM nodes WHERE " + " AND ".join(where_parts) + " LIMIT 1;"
+
+        select_cols = "id, type, properties, vector"
+        if select_extra:
+            select_cols += ", " + ", ".join(select_extra)
+
+        where_clause = " AND ".join(where_parts) if where_parts else "TRUE"
+
+        order_clause = ""
+        if fuzzy:
+            sim_cols = [f"sim_{k}" for k in match_keys
+                        if isinstance((node.properties or {}).get(k), str)]
+            if sim_cols:
+                order_clause = " ORDER BY " + " + ".join(sim_cols) + " DESC"
+
+        query = f"SELECT {select_cols} FROM nodes WHERE {where_clause}{order_clause} LIMIT 1;"
+        params = select_params + where_params
         row = cur.execute(query, params).fetchone()
         if row:
             return Node(id=row[0], type=row[1], properties=json.loads(row[2]), vector=row[3])
@@ -373,11 +419,53 @@ class GraphMemory:
             return existing or {}
         return incoming or {}
 
+    def _safe_update_node(self, cur, node_id: str, node_type, properties: dict, vector) -> None:
+        """Update a node, working around DuckDB FK constraints on UPDATE.
+
+        DuckDB internally deletes+reinserts rows on UPDATE, which triggers FK
+        violations when edges reference the node. This method temporarily removes
+        and restores those edges.
+        """
+        try:
+            cur.execute(
+                "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
+                (node_type, json.dumps(properties), vector, node_id)
+            )
+        except duckdb.ConstraintException:
+            # Stash edges, update node, restore edges
+            edges = cur.execute(
+                "SELECT id, source_id, target_id, relation, weight FROM edges "
+                "WHERE source_id = ? OR target_id = ?;",
+                (node_id, node_id)
+            ).fetchall()
+            for eid, *_ in edges:
+                cur.execute("DELETE FROM edges WHERE id = ?;", (eid,))
+            cur.execute(
+                "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
+                (node_type, json.dumps(properties), vector, node_id)
+            )
+            for eid, src, tgt, rel, wt in edges:
+                cur.execute(
+                    "INSERT INTO edges (id, source_id, target_id, relation, weight) "
+                    "VALUES (?, ?, ?, ?, ?);",
+                    (eid, src, tgt, rel, wt)
+                )
+
+    @staticmethod
+    def normalize_relation(relation: str) -> str:
+        """Lowercase, strip, and collapse whitespace/separators to underscores."""
+        s = relation.strip().lower()
+        s = re.sub(r'[\s\-\.]+', '_', s)
+        s = re.sub(r'_+', '_', s)
+        return s.strip('_')
+
     @with_retry()
     def merge_node(self, node: Node, match_keys: list[str],
                    match_type: bool = True,
                    strategy: MergeStrategy = MergeStrategy.UPDATE,
-                   update_vector: bool = True) -> MergeResult:
+                   update_vector: bool = True,
+                   similarity_threshold: float = 1.0,
+                   vector_threshold: float | None = None) -> MergeResult:
         """Insert a node or update it if a match is found by property keys.
 
         Args:
@@ -401,15 +489,16 @@ class GraphMemory:
         try:
             with self.transaction():
                 cur = self.cursor()
-                existing = self._find_matching_node(cur, node, match_keys, match_type)
+                existing = self._find_matching_node(
+                    cur, node, match_keys, match_type,
+                    similarity_threshold=similarity_threshold,
+                    vector_threshold=vector_threshold,
+                )
                 if existing:
                     merged_props = self._merge_properties(existing.properties, node.properties, strategy)
                     vector = node.vector if update_vector and node.vector else existing.vector
                     node_type = node.type if node.type is not None else existing.type
-                    cur.execute(
-                        "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
-                        (node_type, json.dumps(merged_props), vector, str(existing.id))
-                    )
+                    self._safe_update_node(cur, str(existing.id), node_type, merged_props, vector)
                     self._fts_dirty = True
                     result_node = Node(id=existing.id, type=node_type, properties=merged_props, vector=vector)
                     return MergeResult(node=result_node, created=False)
@@ -429,7 +518,9 @@ class GraphMemory:
     def bulk_merge_nodes(self, nodes: list[Node], match_keys: list[str],
                          match_type: bool = True,
                          strategy: MergeStrategy = MergeStrategy.UPDATE,
-                         update_vector: bool = True) -> list[MergeResult]:
+                         update_vector: bool = True,
+                         similarity_threshold: float = 1.0,
+                         vector_threshold: float | None = None) -> list[MergeResult]:
         """Merge multiple nodes, inserting new ones and updating matches.
 
         Runs in a single transaction for atomicity.
@@ -448,15 +539,16 @@ class GraphMemory:
                     if node.vector and not self._validate_vector(node.vector):
                         logger.error(f"Invalid vector for node, skipping: {node.id}")
                         continue
-                    existing = self._find_matching_node(cur, node, match_keys, match_type)
+                    existing = self._find_matching_node(
+                        cur, node, match_keys, match_type,
+                        similarity_threshold=similarity_threshold,
+                        vector_threshold=vector_threshold,
+                    )
                     if existing:
                         merged_props = self._merge_properties(existing.properties, node.properties, strategy)
                         vector = node.vector if update_vector and node.vector else existing.vector
                         node_type = node.type if node.type is not None else existing.type
-                        cur.execute(
-                            "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
-                            (node_type, json.dumps(merged_props), vector, str(existing.id))
-                        )
+                        self._safe_update_node(cur, str(existing.id), node_type, merged_props, vector)
                         result_node = Node(id=existing.id, type=node_type, properties=merged_props, vector=vector)
                         results.append(MergeResult(node=result_node, created=False))
                     else:
@@ -474,10 +566,14 @@ class GraphMemory:
             raise
 
     def _find_matching_edge(self, cur, edge: Edge) -> Edge | None:
-        """Find an existing edge matching (source_id, target_id, relation)."""
+        """Find an existing edge matching (source_id, target_id, relation).
+
+        Relations are compared in normalized form (lowercase, underscored).
+        """
+        normalized = self.normalize_relation(edge.relation)
         row = cur.execute(
             "SELECT id, source_id, target_id, relation, weight FROM edges WHERE source_id = ? AND target_id = ? AND relation = ? LIMIT 1;",
-            (str(edge.source_id), str(edge.target_id), edge.relation)
+            (str(edge.source_id), str(edge.target_id), normalized)
         ).fetchone()
         if row:
             return Edge(id=row[0], source_id=row[1], target_id=row[2], relation=row[3], weight=row[4])
@@ -511,11 +607,13 @@ class GraphMemory:
                         result_edge = existing
                     return EdgeMergeResult(edge=result_edge, created=False)
                 else:
+                    normalized = self.normalize_relation(edge.relation)
                     cur.execute(
                         "INSERT INTO edges (id, source_id, target_id, relation, weight) VALUES (?, ?, ?, ?, ?);",
-                        (str(edge.id), str(edge.source_id), str(edge.target_id), edge.relation, edge.weight)
+                        (str(edge.id), str(edge.source_id), str(edge.target_id), normalized, edge.weight)
                     )
-                    return EdgeMergeResult(edge=edge, created=True)
+                    result_edge = Edge(id=edge.id, source_id=edge.source_id, target_id=edge.target_id, relation=normalized, weight=edge.weight)
+                    return EdgeMergeResult(edge=result_edge, created=True)
         except duckdb.Error as e:
             logger.error(f"Error during merge edge: {e}")
             raise
@@ -545,14 +643,209 @@ class GraphMemory:
                             result_edge = existing
                         results.append(EdgeMergeResult(edge=result_edge, created=False))
                     else:
+                        normalized = self.normalize_relation(edge.relation)
                         cur.execute(
                             "INSERT INTO edges (id, source_id, target_id, relation, weight) VALUES (?, ?, ?, ?, ?);",
-                            (str(edge.id), str(edge.source_id), str(edge.target_id), edge.relation, edge.weight)
+                            (str(edge.id), str(edge.source_id), str(edge.target_id), normalized, edge.weight)
                         )
-                        results.append(EdgeMergeResult(edge=edge, created=True))
+                        result_edge = Edge(id=edge.id, source_id=edge.source_id, target_id=edge.target_id, relation=normalized, weight=edge.weight)
+                        results.append(EdgeMergeResult(edge=result_edge, created=True))
                 return results
         except duckdb.Error as e:
             logger.error(f"Error during bulk merge edges: {e}")
+            raise
+
+    @with_retry()
+    def resolve_duplicates(
+        self,
+        match_keys: list[str] | None = None,
+        match_type: bool = True,
+        similarity_threshold: float = 0.9,
+        vector_threshold: float | None = None,
+        strategy: MergeStrategy = MergeStrategy.UPDATE,
+    ) -> list[DuplicateCluster]:
+        """Scan all nodes and merge clusters of likely duplicates.
+
+        For each unprocessed node, finds fuzzy matches among remaining nodes.
+        The first node encountered becomes the "survivor"; duplicates have their
+        edges reassigned and are then deleted.
+
+        Args:
+            match_keys: Property names to compare (default ``["name"]``).
+            match_type: Also require ``node.type`` to match (default ``True``).
+            similarity_threshold: Jaro-Winkler threshold for string properties.
+            vector_threshold: Max cosine distance for vector similarity (optional).
+            strategy: How to merge properties from duplicates into the survivor.
+
+        Returns:
+            List of :class:`~graphmemory.models.DuplicateCluster` results.
+        """
+        if match_keys is None:
+            match_keys = ["name"]
+        for key in match_keys:
+            if not self._VALID_ATTRIBUTE_RE.match(key):
+                raise ValueError(f"Invalid match key: {key!r}")
+
+        clusters: list[DuplicateCluster] = []
+        try:
+            cur = self.cursor()
+            all_rows = cur.execute(
+                "SELECT id, type, properties, vector FROM nodes ORDER BY id;"
+            ).fetchall()
+            all_nodes = [
+                Node(id=r[0], type=r[1], properties=json.loads(r[2]), vector=r[3])
+                for r in all_rows
+            ]
+
+            seen: set[str] = set()
+            for node in all_nodes:
+                nid = str(node.id)
+                if nid in seen:
+                    continue
+                seen.add(nid)
+
+                # Build fuzzy query for candidates (separate param lists for ordering)
+                select_extra: list[str] = []
+                select_params: list = []
+                where_parts: list[str] = ["id != ?"]
+                where_params: list = [nid]
+
+                if match_type and node.type is not None:
+                    where_parts.append("type = ?")
+                    where_params.append(node.type)
+
+                for key in match_keys:
+                    value = (node.properties or {}).get(key)
+                    if value is None:
+                        continue
+                    if isinstance(value, str):
+                        alias = f"sim_{key}"
+                        select_extra.append(
+                            f"jaro_winkler_similarity(json_extract_string(properties, '$.{key}'), ?) AS {alias}"
+                        )
+                        select_params.append(value)
+                        where_parts.append(f"{alias} >= ?")
+                        where_params.append(similarity_threshold)
+
+                if vector_threshold is not None and node.vector:
+                    where_parts.append(
+                        f"array_cosine_distance(vector, CAST(? AS FLOAT[{self.vector_length}])) <= ?"
+                    )
+                    where_params.extend([node.vector, vector_threshold])
+
+                if not select_extra:
+                    continue
+
+                # Exclude already-processed nodes
+                if seen - {nid}:
+                    placeholders = ", ".join("?" for _ in seen if _ != nid)
+                    where_parts.append(f"id NOT IN ({placeholders})")
+                    where_params.extend(s for s in seen if s != nid)
+
+                select_cols = "id, type, properties, vector"
+                if select_extra:
+                    select_cols += ", " + ", ".join(select_extra)
+
+                query = f"SELECT {select_cols} FROM nodes WHERE {' AND '.join(where_parts)};"
+                dup_rows = cur.execute(query, select_params + where_params).fetchall()
+
+                if not dup_rows:
+                    continue
+
+                duplicates: list[Node] = []
+                survivor_props = dict(node.properties or {})
+                survivor_vector = node.vector
+                survivor_type = node.type
+                edges_to_rewrite: list[tuple] = []
+
+                for row in dup_rows:
+                    dup = Node(id=row[0], type=row[1], properties=json.loads(row[2]), vector=row[3])
+                    dup_id = str(dup.id)
+                    seen.add(dup_id)
+                    duplicates.append(dup)
+
+                    survivor_props = self._merge_properties(survivor_props, dup.properties, strategy)
+                    if not survivor_vector and dup.vector:
+                        survivor_vector = dup.vector
+                    if not survivor_type and dup.type:
+                        survivor_type = dup.type
+
+                    dup_edges = cur.execute(
+                        "SELECT id, source_id, target_id, relation, weight FROM edges "
+                        "WHERE source_id = ? OR target_id = ?;",
+                        (dup_id, dup_id)
+                    ).fetchall()
+                    for eid, src, tgt, rel, wt in dup_edges:
+                        new_src = nid if src == dup_id else src
+                        new_tgt = nid if tgt == dup_id else tgt
+                        edges_to_rewrite.append((eid, new_src, new_tgt, rel, wt))
+
+                # Delete edges referencing duplicates
+                for dup in duplicates:
+                    cur.execute(
+                        "DELETE FROM edges WHERE source_id = ? OR target_id = ?;",
+                        (str(dup.id), str(dup.id))
+                    )
+                # Also temporarily remove edges referencing survivor (DuckDB
+                # internally does delete+reinsert on UPDATE, triggering FK checks)
+                survivor_edges = cur.execute(
+                    "SELECT id, source_id, target_id, relation, weight FROM edges "
+                    "WHERE source_id = ? OR target_id = ?;",
+                    (nid, nid)
+                ).fetchall()
+                for eid, *_ in survivor_edges:
+                    cur.execute("DELETE FROM edges WHERE id = ?;", (eid,))
+
+                # Delete duplicate nodes
+                for dup in duplicates:
+                    cur.execute("DELETE FROM nodes WHERE id = ?;", (str(dup.id),))
+
+                # Update survivor with merged properties (safe now, no FK refs)
+                cur.execute(
+                    "UPDATE nodes SET type = ?, properties = ?, vector = ? WHERE id = ?;",
+                    (survivor_type, json.dumps(survivor_props), survivor_vector, nid)
+                )
+
+                # Re-insert all edges, verifying both endpoints still exist
+                rewritten_eids = {e[0] for e in edges_to_rewrite}
+                all_edges_to_insert = []
+                for eid, src, tgt, rel, wt in edges_to_rewrite:
+                    if src == tgt:
+                        continue  # skip self-loops
+                    all_edges_to_insert.append((eid, src, tgt, rel, wt))
+                for eid, src, tgt, rel, wt in survivor_edges:
+                    if eid in rewritten_eids:
+                        continue
+                    all_edges_to_insert.append((eid, src, tgt, rel, wt))
+
+                for eid, src, tgt, rel, wt in all_edges_to_insert:
+                    src_exists = cur.execute(
+                        "SELECT 1 FROM nodes WHERE id = ?", (str(src),)
+                    ).fetchone()
+                    tgt_exists = cur.execute(
+                        "SELECT 1 FROM nodes WHERE id = ?", (str(tgt),)
+                    ).fetchone()
+                    if src_exists and tgt_exists:
+                        cur.execute(
+                            "INSERT INTO edges (id, source_id, target_id, relation, weight) "
+                            "VALUES (?, ?, ?, ?, ?);",
+                            (eid, src, tgt, rel, wt)
+                        )
+
+                survivor = Node(id=node.id, type=survivor_type, properties=survivor_props, vector=survivor_vector)
+                clusters.append(DuplicateCluster(survivor=survivor, merged=duplicates))
+
+            if clusters:
+                self._fts_dirty = True
+
+            logger.info(
+                "Resolved %d duplicate clusters (%d nodes merged).",
+                len(clusters),
+                sum(len(c.merged) for c in clusters),
+            )
+            return clusters
+        except duckdb.Error as e:
+            logger.error(f"Error during resolve_duplicates: {e}")
             raise
 
     @with_retry()

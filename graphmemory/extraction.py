@@ -115,8 +115,13 @@ def _get_signatures():
 # ---------------------------------------------------------------------------
 
 
+def _make_predictor(dspy, signature):
+    """Create a DSPy v3 predictor from a Signature."""
+    return dspy.Predict(signature)
+
+
 def extract_nodes(text: str, sentences: list[str] | None = None) -> list[Node]:
-    """Extract entity nodes from text using a DSPy typed predictor.
+    """Extract entity nodes from text using a DSPy predictor.
 
     Args:
         text: Full text to extract from (used when *sentences* is ``None``).
@@ -129,7 +134,7 @@ def extract_nodes(text: str, sentences: list[str] | None = None) -> list[Node]:
     """
     dspy = _require_dspy()
     NodeSig, _ = _get_signatures()
-    predictor = dspy.TypedPredictor(NodeSig)
+    predictor = _make_predictor(dspy, NodeSig)
 
     if sentences is None:
         sentences = [s.strip() for s in text.split(".") if s.strip()]
@@ -166,7 +171,7 @@ def extract_edges(
     """
     dspy = _require_dspy()
     _, EdgeSig = _get_signatures()
-    predictor = dspy.TypedPredictor(EdgeSig)
+    predictor = _make_predictor(dspy, EdgeSig)
 
     if sentences is None:
         sentences = [s.strip() for s in text.split(".") if s.strip()]
@@ -253,6 +258,8 @@ def extract_and_merge(
     match_type: bool = True,
     strategy: MergeStrategy = MergeStrategy.UPDATE,
     sentences: list[str] | None = None,
+    similarity_threshold: float = 1.0,
+    vector_threshold: float | None = None,
 ) -> tuple[list[MergeResult], list[EdgeMergeResult]]:
     """Extract nodes and edges from text, merging with existing graph data.
 
@@ -278,6 +285,7 @@ def extract_and_merge(
 
     node_results = graph.bulk_merge_nodes(
         nodes, match_keys=match_keys, match_type=match_type, strategy=strategy,
+        similarity_threshold=similarity_threshold, vector_threshold=vector_threshold,
     ) if nodes else []
 
     edge_results = graph.bulk_merge_edges(edges) if edges else []

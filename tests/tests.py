@@ -11,7 +11,7 @@ import unittest
 from pydantic import ValidationError
 
 from graphmemory.database import GraphMemory
-from graphmemory.models import Edge, EdgeMergeResult, MergeResult, MergeStrategy, Node
+from graphmemory.models import DuplicateCluster, Edge, EdgeMergeResult, MergeResult, MergeStrategy, Node
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
@@ -2565,6 +2565,168 @@ class TestBulkMergeEdges(unittest.TestCase):
         self.db.bulk_merge_edges(edges)
         self.db.bulk_merge_edges(edges)
         self.assertEqual(len(self.db.edges_to_json()), 2)
+
+
+class TestFuzzyMatching(unittest.TestCase):
+    """Tests for fuzzy node matching, relation normalization, and duplicate resolution."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+
+    # --- Fuzzy node merge ---
+
+    def test_fuzzy_merge_matches_similar_names(self):
+        """'Jon Smith' and 'John Smith' should merge at threshold 0.85."""
+        n1 = Node(type="Person", properties={"name": "John Smith"}, vector=[1, 0, 0])
+        self.db.insert_node(n1)
+        n2 = Node(type="Person", properties={"name": "Jon Smith"}, vector=[1, 0, 0])
+        result = self.db.merge_node(n2, match_keys=["name"], similarity_threshold=0.85)
+        self.assertFalse(result.created)
+        self.assertEqual(str(result.node.id), str(n1.id))
+
+    def test_fuzzy_merge_no_match_at_exact(self):
+        """'Jon Smith' and 'John Smith' should NOT merge at threshold 1.0 (exact)."""
+        n1 = Node(type="Person", properties={"name": "John Smith"}, vector=[1, 0, 0])
+        self.db.insert_node(n1)
+        n2 = Node(type="Person", properties={"name": "Jon Smith"}, vector=[1, 0, 0])
+        result = self.db.merge_node(n2, match_keys=["name"], similarity_threshold=1.0)
+        self.assertTrue(result.created)
+
+    def test_fuzzy_merge_dissimilar_names_no_match(self):
+        """Completely different names should not merge even with fuzzy."""
+        n1 = Node(type="Person", properties={"name": "Alice Johnson"}, vector=[1, 0, 0])
+        self.db.insert_node(n1)
+        n2 = Node(type="Person", properties={"name": "Bob Williams"}, vector=[1, 0, 0])
+        result = self.db.merge_node(n2, match_keys=["name"], similarity_threshold=0.85)
+        self.assertTrue(result.created)
+
+    def test_fuzzy_merge_respects_type(self):
+        """Even if names are similar, different types should not merge when match_type=True."""
+        n1 = Node(type="Person", properties={"name": "Springfield"}, vector=[1, 0, 0])
+        self.db.insert_node(n1)
+        n2 = Node(type="Location", properties={"name": "Springfield"}, vector=[1, 0, 0])
+        result = self.db.merge_node(n2, match_keys=["name"], similarity_threshold=0.85)
+        self.assertTrue(result.created)
+
+    def test_bulk_fuzzy_merge(self):
+        """bulk_merge_nodes should also support fuzzy matching."""
+        n1 = Node(type="Person", properties={"name": "Barack Obama"}, vector=[1, 0, 0])
+        self.db.insert_node(n1)
+        nodes = [
+            Node(type="Person", properties={"name": "Barak Obama"}, vector=[1, 0, 0]),
+            Node(type="Person", properties={"name": "Charlie Brown"}, vector=[0, 1, 0]),
+        ]
+        results = self.db.bulk_merge_nodes(nodes, match_keys=["name"], similarity_threshold=0.85)
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[0].created)  # merged with Barack Obama
+        self.assertTrue(results[1].created)   # new node
+
+    def test_fuzzy_merge_with_vector_threshold(self):
+        """Vector threshold should be an additional filter on fuzzy match."""
+        n1 = Node(type="Person", properties={"name": "John Smith"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(n1)
+        # Similar name, very different vector
+        n2 = Node(type="Person", properties={"name": "Jon Smith"}, vector=[0.0, 0.0, 1.0])
+        result = self.db.merge_node(
+            n2, match_keys=["name"], similarity_threshold=0.85, vector_threshold=0.1
+        )
+        self.assertTrue(result.created)  # vector too different
+
+    # --- Relation normalization ---
+
+    def test_normalize_relation_basic(self):
+        self.assertEqual(GraphMemory.normalize_relation("Works At"), "works_at")
+        self.assertEqual(GraphMemory.normalize_relation("works-at"), "works_at")
+        self.assertEqual(GraphMemory.normalize_relation("works_at"), "works_at")
+        self.assertEqual(GraphMemory.normalize_relation("  LOCATED.IN  "), "located_in")
+
+    def test_edge_merge_normalizes_relation(self):
+        """'Works At' and 'works_at' should be treated as same edge."""
+        n1 = Node(properties={"name": "Alice"}, vector=[1, 0, 0])
+        n2 = Node(properties={"name": "Acme"}, vector=[0, 1, 0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        e1 = Edge(source_id=n1.id, target_id=n2.id, relation="Works At", weight=1.0)
+        r1 = self.db.merge_edge(e1)
+        self.assertTrue(r1.created)
+        self.assertEqual(r1.edge.relation, "works_at")
+        e2 = Edge(source_id=n1.id, target_id=n2.id, relation="works-at", weight=0.5)
+        r2 = self.db.merge_edge(e2, update_weight=True)
+        self.assertFalse(r2.created)  # deduplicated
+
+    def test_bulk_edge_merge_normalizes(self):
+        n1 = Node(properties={"name": "A"}, vector=[1, 0, 0])
+        n2 = Node(properties={"name": "B"}, vector=[0, 1, 0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        edges = [
+            Edge(source_id=n1.id, target_id=n2.id, relation="Works At"),
+            Edge(source_id=n1.id, target_id=n2.id, relation="works_at"),
+        ]
+        results = self.db.bulk_merge_edges(edges)
+        created_count = sum(1 for r in results if r.created)
+        self.assertEqual(created_count, 1)  # second was deduplicated
+
+    # --- resolve_duplicates ---
+
+    def test_resolve_duplicates_merges_similar_nodes(self):
+        n1 = Node(type="Person", properties={"name": "John Smith", "age": 30}, vector=[1, 0, 0])
+        n2 = Node(type="Person", properties={"name": "Jon Smith", "email": "j@x.com"}, vector=[1, 0, 0])
+        n3 = Node(type="Person", properties={"name": "Alice Brown"}, vector=[0, 1, 0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        self.db.insert_node(n3)
+
+        clusters = self.db.resolve_duplicates(
+            match_keys=["name"], similarity_threshold=0.85
+        )
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(len(clusters[0].merged), 1)
+        # Survivor should have merged properties
+        self.assertIn("age", clusters[0].survivor.properties)
+        self.assertIn("email", clusters[0].survivor.properties)
+        # Only 2 nodes remain
+        remaining = self.db.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(remaining, 2)
+
+    def test_resolve_duplicates_reassigns_edges(self):
+        n1 = Node(type="Person", properties={"name": "John Smith"}, vector=[1, 0, 0])
+        n2 = Node(type="Person", properties={"name": "Jon Smith"}, vector=[1, 0, 0])
+        n3 = Node(type="Person", properties={"name": "Alice Brown"}, vector=[0, 1, 0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        self.db.insert_node(n3)
+        # Edges from both Smiths to Alice — guarantees survivor keeps an edge
+        self.db.insert_edge(Edge(source_id=n1.id, target_id=n3.id, relation="knows"))
+        self.db.insert_edge(Edge(source_id=n2.id, target_id=n3.id, relation="knows"))
+
+        clusters = self.db.resolve_duplicates(
+            match_keys=["name"], similarity_threshold=0.85
+        )
+        self.assertEqual(len(clusters), 1)
+        survivor_id = str(clusters[0].survivor.id)
+        # At least one edge should point from survivor to Alice
+        edges = self.db.conn.execute(
+            "SELECT source_id FROM edges WHERE target_id = ?", (str(n3.id),)
+        ).fetchall()
+        self.assertGreaterEqual(len(edges), 1)
+        self.assertTrue(any(str(e[0]) == survivor_id for e in edges))
+        # Only 2 nodes remain
+        remaining = self.db.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(remaining, 2)
+
+    def test_resolve_duplicates_no_false_merges(self):
+        """Nodes with very different names should not be merged."""
+        n1 = Node(type="Person", properties={"name": "Alice"}, vector=[1, 0, 0])
+        n2 = Node(type="Person", properties={"name": "Bob"}, vector=[0, 1, 0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        clusters = self.db.resolve_duplicates(
+            match_keys=["name"], similarity_threshold=0.9
+        )
+        self.assertEqual(len(clusters), 0)
+        remaining = self.db.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(remaining, 2)
 
 
 if __name__ == '__main__':
