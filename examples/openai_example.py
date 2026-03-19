@@ -1,41 +1,51 @@
-from graphmemory import GraphMemory, Node, Edge
-
 import json
-from openai import OpenAI
 import os
+
+from openai import OpenAI
+
+from graphmemory import Edge, GraphMemory, Node
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # Sample unstructured text
 gw_text = "George Washington was the first President of the United States and served from 1789 to 1797."
 tj_text = "Thomas Jefferson was the first Secretary of State of the United States and served from 1790 to 1793."
-ah_text = "Alexander Hamilton was the first Secretary of the Treasury of the United States and served from 1789 to 1795."
+ah_text = (
+    "Alexander Hamilton was the first Secretary of the Treasury of the United States and served from 1789 to 1795."
+)
+
 
 # Extract structured data from unstructured text
 def extract_attributes(text):
-    return json.loads(client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Extract structured data from this text using the following attributes: \
-             name, title, country, term_start, term_end"},
-            {"role": "user", "content": text}
-        ],
-        seed=1
-    ).choices[0].message.content)
+    return json.loads(
+        client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Extract structured data from this text using the following attributes: \
+             name, title, country, term_start, term_end",
+                },
+                {"role": "user", "content": text},
+            ],
+            seed=1,
+        )
+        .choices[0]
+        .message.content
+    )
+
 
 # Calculate embedding for a given input
 def calculate_embedding(input_json):
-    return client.embeddings.create(
-        input=input_json,
-        model="text-embedding-3-small"
-    ).data[0].embedding
+    return client.embeddings.create(input=input_json, model="text-embedding-3-small").data[0].embedding
+
 
 gw_embedding = calculate_embedding(gw_text)
 tj_embedding = calculate_embedding(tj_text)
 ah_embedding = calculate_embedding(ah_text)
 
 # Initialize the database from disk (make sure to set vector_length correctly)
-graph_db = GraphMemory(database='graph.db', vector_length=len(gw_embedding))
+graph_db = GraphMemory(database="graph.db", vector_length=len(gw_embedding))
 
 # Extract structured data from unstructured text
 gw_attributes = extract_attributes(gw_text)

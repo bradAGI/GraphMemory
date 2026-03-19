@@ -1,11 +1,3 @@
-<a href="https://rapidapi.com/graphmemory-graphmemory-default/api/graphmemory-graphrag-api-for-llms" target="_blank">
-	<img src="https://storage.googleapis.com/rapidapi-documentation/connect-on-rapidapi-dark.png" width="215" alt="Connect on RapidAPI">
-</a>
-
-
-[![](https://img.shields.io/badge/RapidAPI-Managed_Cloud_Version-blue?logo=rapid)](https://rapidapi.com/graphmemory-graphmemory-default/api/graphmemory-graphrag-api-for-llms)
-
-
 [![](https://dcbadge.limes.pink/api/server/https://discord.gg/DSS3DmStV8)](https://discord.gg/DSS3DmStV8)
 
 # GraphMemory - GraphRAG Database
@@ -13,15 +5,25 @@
 ![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/9897dc2a-46c9-42e0-a8d3-2dcb1d93e6ae)
 
 ## Overview
-This project provides an embedded graph database implementation with vector similarity search (VSS) using DuckDB. It includes a Python class `GraphMemory` for managing nodes and edges. 
+An embedded graph database with vector similarity search (VSS), full-text search (BM25), and hybrid search using DuckDB. The `GraphMemory` class provides a complete API for managing nodes and edges, with support for Cypher queries, graph import/export, connection pooling, and automatic retry logic.
 
-Each node has a unique ID, a JSON properties field (any arbitrary dictionary), a node type (ex: Person, Organization, etc.), and a vector of floating point values. 
+Each node has a unique ID, a JSON properties field (any arbitrary dictionary), a node type (ex: Person, Organization, etc.), and a vector of floating point values.
 
 Each edge has a unique ID, a source node ID, a target node ID, a relationship type (ex: served_under, worked_with, etc.), and a weight.
 
 This database can be used for any graph-based RAG application or knowledge graph application.
 
 Vector embeddings can be created using [sentence-transformers](https://www.sbert.net/) or other API based models.
+
+## Features
+
+- **Vector Similarity Search** — HNSW-indexed nearest neighbor search with L2, cosine, and inner product distance metrics
+- **Full-Text Search** — BM25-scored text search across node properties
+- **Hybrid Search** — Combined vector + text search with configurable weights
+- **Cypher Queries** — Query the graph using Cypher-like syntax
+- **Graph Import/Export** — JSON, CSV, and GraphML formats
+- **Connection Pooling** — Thread-safe operations with automatic retry on transient errors
+- **Context Manager** — Use `with` statements for automatic resource cleanup
 
 ## Installation
 ```sh
@@ -30,8 +32,26 @@ pip install graphmemory
 
 ## Usage
 
-### GraphMemory Class
-The `GraphMemory` class provides methods to manage nodes and edges, perform bulk inserts, create indexes, and find nearest neighbors using vector similarity search.
+### Initialization
+
+```python
+from graphmemory import GraphMemory, Node, Edge
+
+# In-memory database
+graph_db = GraphMemory(vector_length=1536)
+
+# Persistent database with cosine distance
+graph_db = GraphMemory(
+    database='graph.db',
+    vector_length=1536,
+    distance_metric='cosine'  # 'l2', 'cosine', or 'inner_product'
+)
+
+# Using context manager
+with GraphMemory(database='graph.db', vector_length=1536) as graph_db:
+    # ... operations ...
+    pass  # connection closed automatically
+```
 
 ### Auto Generated UUID
 IDs for nodes and edges are auto generated UUIDs.
@@ -40,6 +60,7 @@ IDs for nodes and edges are auto generated UUIDs.
 The `GraphMemory` class supports Cypher queries via the `cypher` method.
 
 Example: `MATCH (n:Person {name: 'George Washington', age: 57}) RETURN n`
+
 ### Example Usage
 ```python
 from graphmemory import GraphMemory, Node, Edge
@@ -151,6 +172,20 @@ print(nearest_nodes)
 print("Nearest Node Data:", nearest_nodes[0].node.properties)
 print("Nearest Node Distance:", nearest_nodes[0].distance)
 
+# Full-text search across node properties
+results = graph_db.search_nodes("President", limit=5)
+for result in results:
+    print(f"Found: {result.node.properties} (score: {result.score})")
+
+# Hybrid search (combines vector similarity + text search)
+results = graph_db.hybrid_search(
+    query_text="President",
+    query_vector=calculate_embedding("President of the United States"),
+    limit=5,
+    text_weight=0.5,
+    vector_weight=0.5
+)
+
 # Get node/s by attribute (Who was the Secretary of State?)
 nodes = graph_db.nodes_by_attribute("title", "Secretary of State")
 if nodes:
@@ -165,78 +200,140 @@ for node in connected_nodes:
 # Fetch a node by UUID
 fetched_node = graph_db.get_node(gw_node_id)
 
+# Update a node
+graph_db.update_node(gw_node_id, properties={"name": "George Washington", "title": "President"})
+
 # Delete an edge by source / target node id
 graph_db.delete_edge(edge1.source_id, edge1.target_id)
+
+# Export the graph
+graph_json = graph_db.export_graph(format='json')
+graph_csv = graph_db.export_graph(format='csv')
+graph_graphml = graph_db.export_graph(format='graphml')
 ```
 
+## Data Models
 
-## GraphMemory Class Methods
+### Node
+```python
+Node(
+    id: uuid.UUID,          # Auto-generated
+    properties: dict | None, # Arbitrary key-value pairs
+    type: str | None,        # Node type (e.g., "Person", "Organization")
+    vector: list[float] | None  # Embedding vector
+)
+```
 
-The `GraphMemory` class provides the following public methods for interacting with the graph database:
+### Edge
+```python
+Edge(
+    id: uuid.UUID,           # Auto-generated
+    source_id: uuid.UUID,    # Source node ID
+    target_id: uuid.UUID,    # Target node ID
+    relation: str | None,    # Relationship type (e.g., "served_under")
+    weight: float | None     # Edge weight
+)
+```
 
-1. `__init__(self, database=None, vector_length=3)`
-   - Initializes the database connection and sets up the database vector length.
+### NearestNode
+```python
+NearestNode(
+    node: Node,       # The matched node
+    distance: float   # Distance from query vector
+)
+```
 
-2. `set_vector_length(self, vector_length)`
-   - Sets the length of the vectors for the nodes in the database.
+### SearchResult
+```python
+SearchResult(
+    node: Node,    # The matched node
+    score: float   # Relevance score
+)
+```
 
-3. `insert_node(self, node: Node) -> uuid.UUID`
-   - Inserts a node into the database and returns the node ID.
+## GraphMemory API Reference
 
-4. `insert_edge(self, edge: Edge)`
-   - Inserts an edge between two nodes in the database.
+### Initialization & Connection
 
-5. `bulk_insert_nodes(self, nodes: List[Node]) -> List[Node]`
-   - Performs a bulk insert of multiple nodes into the database.
+| Method | Description |
+|--------|-------------|
+| `__init__(database=None, vector_length=3, distance_metric='l2', max_retries=3, retry_base_delay=0.1)` | Initialize the database. `database`: file path or `None` for in-memory. `distance_metric`: `'l2'`, `'cosine'`, or `'inner_product'`. |
+| `close()` | Close the database connection (thread-safe). |
+| `cursor()` | Return a new DuckDB cursor for individual operations. |
+| `transaction()` | Context manager for database transactions. |
 
-6. `bulk_insert_edges(self, edges: List[Edge])`
-   - Performs a bulk insert of multiple edges into the database.
+### Node Operations
 
-7. `delete_node(self, node_id: uuid.UUID)`
-   - Deletes a node and its associated edges from the database.
+| Method | Description |
+|--------|-------------|
+| `insert_node(node: Node) -> uuid.UUID` | Insert a node and return its ID. |
+| `bulk_insert_nodes(nodes: list[Node]) -> list[Node]` | Bulk insert multiple nodes. |
+| `get_node(node_id: uuid.UUID) -> Node` | Retrieve a node by ID. |
+| `update_node(node_id: uuid.UUID, **kwargs) -> bool` | Update node fields (`type`, `properties`, `vector`). |
+| `delete_node(node_id: uuid.UUID)` | Delete a node and its associated edges. |
+| `bulk_delete_nodes(node_ids: list[uuid.UUID])` | Bulk delete multiple nodes and their edges. |
+| `nodes_by_attribute(attribute, value, limit=None, offset=None) -> list[Node]` | Query nodes by a property key-value pair. |
+| `get_nodes_vector(node_id: uuid.UUID) -> list[float]` | Retrieve the vector of a node. |
+| `nodes_to_json(limit=None, offset=None) -> list[dict]` | Export all nodes as JSON. |
 
-8. `delete_edge(self, source_id: uuid.UUID, target_id: uuid.UUID)`
-   - Deletes an edge from the database.
+### Edge Operations
 
-9. `create_index(self)`
-    - Creates an index on the node vectors to improve search performance.
+| Method | Description |
+|--------|-------------|
+| `insert_edge(edge: Edge)` | Insert an edge between two nodes. |
+| `bulk_insert_edges(edges: list[Edge])` | Bulk insert multiple edges. |
+| `get_edge(edge_id: uuid.UUID) -> Edge \| None` | Retrieve an edge by ID. |
+| `get_edges_by_relation(relation: str) -> list[Edge]` | Get all edges with a given relation type. |
+| `edges_by_attribute(attribute: str, value) -> list[Edge]` | Query edges by attribute. |
+| `update_edge(edge_id: uuid.UUID, **kwargs) -> bool` | Update edge fields (`relation`, `weight`). |
+| `delete_edge(source_id: uuid.UUID, target_id: uuid.UUID)` | Delete an edge by source and target node IDs. |
+| `bulk_delete_edges(edge_ids: list[uuid.UUID])` | Bulk delete multiple edges. |
+| `edges_to_json(limit=None, offset=None) -> list[dict]` | Export all edges as JSON. |
 
-10. `nearest_nodes(self, vector: List[float], limit: int) -> List[NearestNode]`
-    - Finds and returns the nearest neighbor nodes based on vector similarity.
+### Search & Similarity
 
-11. `connected_nodes(self, node_id: uuid.UUID) -> List[Node]`
-    - Retrieves all nodes directly connected to the specified node.
+| Method | Description |
+|--------|-------------|
+| `nearest_nodes(vector: list[float], limit: int) -> list[NearestNode]` | Find nearest neighbors by vector similarity. |
+| `search_nodes(query_text: str, limit: int = 10) -> list[SearchResult]` | Full-text search across node properties (BM25). |
+| `hybrid_search(query_text, query_vector, limit=10, text_weight=0.5, vector_weight=0.5) -> list[SearchResult]` | Combined text + vector search with configurable weights. |
+| `create_index()` | Create an HNSW index on node vectors for faster search. |
+| `set_vector_length(vector_length)` | Set the vector dimension for the database. |
 
-12. `nodes_to_json(self)` 
-    - Returns a JSON representation of all nodes in the database.
+### Graph Traversal
 
-13. `edges_to_json(self)`
-    - Returns a JSON representation of all edges in the database.
+| Method | Description |
+|--------|-------------|
+| `connected_nodes(node_id: uuid.UUID) -> list[Node]` | Retrieve all nodes connected to a given node. |
+| `cypher(cypher_query)` | Execute a Cypher-like query. |
 
-14. `get_node(self, node_id: uuid.UUID) -> Node`
-    - Retrieves a specific node by its ID.
+### Import / Export
 
-15. `nodes_by_attribute(self, attribute, value) -> List[Node]`
-    - Retrieves nodes that match a specific attribute and value.
+| Method | Description |
+|--------|-------------|
+| `export_graph(format='json')` | Export the graph. Formats: `'json'`, `'json_string'`, `'csv'`, `'graphml'`. |
+| `import_graph(data, format='json')` | Import a graph from the given data and format. |
 
-16. `get_nodes_vector(self, node_id: uuid.UUID) -> List[float]`
-    - Retrieves the vector of a specific node by its ID.
+### Utility
 
-17. `print_json(self)`
-    - Prints the JSON representation of all nodes and edges in the database.
+| Method | Description |
+|--------|-------------|
+| `print_json()` | Print a JSON representation of all nodes and edges. |
 
-18. `cypher(self, cypher_query)`
-    - Executes a Cypher query and returns the results.
+## Examples
 
-These methods facilitate the management and querying of the graph database, allowing for efficient data handling and retrieval.
+See the `examples/` directory for complete usage examples:
+
+- **`openai_example.py`** — Uses OpenAI embeddings for node creation, similarity search, and attribute queries
+- **`lexical_graph.py`** — Wikipedia text extraction with SentenceTransformer embeddings
+- **`dspy_example_typed_pred.py`** — Knowledge graph extraction from unstructured text using DSPy
 
 ## Testing
 Unit tests are provided in `tests/tests.py`.
 
 ### Running Tests
-To run the unit tests, use the following command:
 ```sh
-python -m unittest discover -s tests
+python3 -m unittest discover -s tests
 ```
 
 ## License
@@ -244,4 +341,3 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ## Contributing
 Contributions are welcome! Please open an issue or submit a pull request.
-
