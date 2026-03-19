@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "graphmemory"
-version = "1.0.1"
+version = "1.0.2"
 description = "Graph-based memory system using DuckDB"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Brad Egan", email = "bradegan@gmail.com" },
+    { name = "bradAGI" },
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

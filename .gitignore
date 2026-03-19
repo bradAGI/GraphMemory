@@ -7,3 +7,5 @@ build/
 .env
 *.db
 .pytest_cache/
+video/node_modules/
+video/out/
