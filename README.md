@@ -20,6 +20,8 @@ Vector embeddings can be created using [sentence-transformers](https://www.sbert
 - **Vector Similarity Search** — HNSW-indexed nearest neighbor search with L2, cosine, and inner product distance metrics
 - **Full-Text Search** — BM25-scored text search across node properties
 - **Hybrid Search** — Combined vector + text search with configurable weights
+- **DSPy Extraction** — Automatic entity and relationship extraction from unstructured text using DSPy typed predictors
+- **Graph Algorithms** — PageRank, betweenness centrality, degree distribution, and connected components via NetworkX
 - **Query Builder** — Fluent, composable, parameterized query API with traversal support
 - **Graph Import/Export** — JSON, CSV, and GraphML formats
 - **Connection Pooling** — Thread-safe operations with automatic retry on transient errors
@@ -30,6 +32,12 @@ Vector embeddings can be created using [sentence-transformers](https://www.sbert
 ### From PyPI
 ```sh
 pip install graphmemory
+```
+
+### Optional Dependencies
+```sh
+pip install graphmemory[extraction]   # DSPy-based entity/relationship extraction
+pip install graphmemory[algorithms]   # Graph algorithms via NetworkX
 ```
 
 ### From Source (Development)
@@ -81,6 +89,75 @@ results = graph.query().match(type="Person").order_by("name").limit(10).offset(0
 # Query edges from Person nodes
 edges = graph.query().match(type="Person").edges().execute()
 ```
+
+### DSPy Extraction
+
+The `graphmemory.extraction` module uses [DSPy](https://dspy.ai/) typed predictors to automatically extract entities (nodes) and relationships (edges) from unstructured text. Requires the `extraction` optional dependency.
+
+```python
+from graphmemory import GraphMemory
+from graphmemory.extraction import extract, extract_and_store
+import dspy
+
+# Configure your DSPy language model
+dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"))
+
+text = """George Washington was the first President of the United States.
+Thomas Jefferson served as Secretary of State under Washington.
+Alexander Hamilton was the first Secretary of the Treasury."""
+
+# Extract nodes and edges without storing
+nodes, edges = extract(text)
+for node in nodes:
+    print(f"{node.type}: {node.properties}")
+
+# Or extract and insert directly into a GraphMemory instance
+graph_db = GraphMemory(vector_length=3)
+inserted_nodes, edges = extract_and_store(graph_db, text)
+```
+
+Available functions:
+
+| Function | Description |
+|----------|-------------|
+| `extract_nodes(text, sentences=None) -> list[Node]` | Extract entity nodes (proper nouns) from text. |
+| `extract_edges(text, nodes, sentences=None) -> list[Edge]` | Extract relationships between known nodes. |
+| `extract(text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract both nodes and edges in one call. |
+| `extract_and_store(graph, text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract and insert into a GraphMemory instance. |
+
+### Graph Algorithms
+
+The `graphmemory.algorithms` module provides graph analysis via [NetworkX](https://networkx.org/). Requires the `algorithms` optional dependency.
+
+```python
+from graphmemory import GraphMemory
+from graphmemory.algorithms import pagerank, betweenness_centrality, connected_components, to_networkx
+
+graph_db = GraphMemory(vector_length=3)
+# ... insert nodes and edges ...
+
+# Compute PageRank scores
+scores = pagerank(graph_db)
+
+# Find betweenness centrality
+centrality = betweenness_centrality(graph_db)
+
+# Get connected components
+components = connected_components(graph_db)
+
+# Export to NetworkX for custom analysis
+G = to_networkx(graph_db)
+```
+
+Available functions:
+
+| Function | Description |
+|----------|-------------|
+| `to_networkx(graph) -> nx.DiGraph` | Export a GraphMemory instance to a NetworkX DiGraph. |
+| `pagerank(graph, alpha=0.85, max_iter=100, tol=1e-6) -> dict[str, float]` | Compute PageRank for every node. |
+| `betweenness_centrality(graph, normalized=True, endpoints=False) -> dict[str, float]` | Compute betweenness centrality for every node. |
+| `degree_distribution(graph) -> dict[str, dict[str, int]]` | Compute in/out/total degree for every node. |
+| `connected_components(graph) -> list[set[str]]` | Find weakly connected components (sorted largest-first). |
 
 ### Example Usage
 ```python
@@ -269,6 +346,15 @@ NearestNode(
 SearchResult(
     node: Node,    # The matched node
     score: float   # Relevance score
+)
+```
+
+### TraversalResult
+```python
+TraversalResult(
+    node: Node,              # The reached node
+    depth: int,              # Hops from source
+    path: list[uuid.UUID]    # Node IDs in the path from source
 )
 ```
 
