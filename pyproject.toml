@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 algorithms = ["networkx>=3.0"]
+extraction = ["dspy>=2.5"]
 
 [tool.ruff]
 target-version = "py310"
