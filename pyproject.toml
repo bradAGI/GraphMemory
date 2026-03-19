@@ -1,16 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "graphmemory"
-version = "0.1.0"
+version = "1.0.1"
 description = "Graph-based memory system using DuckDB"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+authors = [
+    { name = "Brad Egan", email = "bradegan@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
-    "duckdb==1.0.0",
-    "pydantic==2.7.3",
+    "duckdb>=1.5.0",
+    "pydantic>=2.12.5",
 ]
 
 [project.optional-dependencies]
-algorithms = ["networkx>=3.0"]
-extraction = ["dspy>=2.5"]
+algorithms = ["networkx>=3.6", "scipy>=1.14"]
+extraction = ["dspy>=3.1"]
+
+[project.urls]
+Homepage = "https://github.com/bradAGI/GraphMemory"
+Repository = "https://github.com/bradAGI/GraphMemory"
+Issues = "https://github.com/bradAGI/GraphMemory/issues"
 
 [tool.ruff]
 target-version = "py310"

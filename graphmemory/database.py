@@ -427,7 +427,6 @@ class GraphMemory:
             return []
 
         dist_func = self.DISTANCE_METRICS[self.distance_metric]['function']
-        dist_func = self.DISTANCE_METRICS[self.distance_metric]["function"]
         query = f"""
         SELECT id, type, properties, vector, {dist_func}(vector, CAST(? AS FLOAT[{self.vector_length}])) AS distance
         FROM nodes
