@@ -31,3 +31,26 @@ class NearestNode(BaseModel):
 class SearchResult(BaseModel):
     node: Node
     score: float
+
+
+class TraversalResult(BaseModel):
+    node: Node
+    depth: int
+    path: list[uuid.UUID] = Field(default_factory=list, description="Node IDs in the path from source to this node.")
+
+
+class RetrievalContext(BaseModel):
+    """A single piece of context from a retrieved node with its relationship path."""
+    node: Node
+    relationships: list[dict[str, Any]] = Field(default_factory=list, description="Edges connecting this node to the query results")
+    hop_distance: int = Field(default=0, description="Number of hops from the nearest seed node")
+
+
+class RetrievalResult(BaseModel):
+    """Result of a full GraphRAG retrieval pipeline."""
+    query: str
+    contexts: list[RetrievalContext] = Field(default_factory=list, description="Retrieved context items ordered by relevance")
+    context_text: str = Field(default="", description="Assembled prompt-ready context string")
+    token_estimate: int = Field(default=0, description="Estimated token count of context_text")
+    seed_node_count: int = Field(default=0, description="Number of initial nodes found by search")
+    total_node_count: int = Field(default=0, description="Total nodes after graph expansion")

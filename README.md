@@ -5,7 +5,7 @@
 ![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/9897dc2a-46c9-42e0-a8d3-2dcb1d93e6ae)
 
 ## Overview
-An embedded graph database with vector similarity search (VSS), full-text search (BM25), and hybrid search using DuckDB. The `GraphMemory` class provides a complete API for managing nodes and edges, with support for Cypher queries, graph import/export, connection pooling, and automatic retry logic.
+An embedded graph database with vector similarity search (VSS), full-text search (BM25), and hybrid search using DuckDB. The `GraphMemory` class provides a complete API for managing nodes and edges, with a fluent query builder, graph import/export, connection pooling, and automatic retry logic.
 
 Each node has a unique ID, a JSON properties field (any arbitrary dictionary), a node type (ex: Person, Organization, etc.), and a vector of floating point values.
 
@@ -20,7 +20,7 @@ Vector embeddings can be created using [sentence-transformers](https://www.sbert
 - **Vector Similarity Search** — HNSW-indexed nearest neighbor search with L2, cosine, and inner product distance metrics
 - **Full-Text Search** — BM25-scored text search across node properties
 - **Hybrid Search** — Combined vector + text search with configurable weights
-- **Cypher Queries** — Query the graph using Cypher-like syntax
+- **Query Builder** — Fluent, composable, parameterized query API with traversal support
 - **Graph Import/Export** — JSON, CSV, and GraphML formats
 - **Connection Pooling** — Thread-safe operations with automatic retry on transient errors
 - **Context Manager** — Use `with` statements for automatic resource cleanup
@@ -65,10 +65,22 @@ with GraphMemory(database='graph.db', vector_length=1536) as graph_db:
 ### Auto Generated UUID
 IDs for nodes and edges are auto generated UUIDs.
 
-### Support for Cypher Queries
-The `GraphMemory` class supports Cypher queries via the `cypher` method.
+### Query Builder
+The `GraphMemory` class provides a fluent query builder via the `query()` method. All conditions use parameterized queries for safety.
 
-Example: `MATCH (n:Person {name: 'George Washington', age: 57}) RETURN n`
+```python
+# Find all Person nodes named George Washington
+results = graph.query().match(type="Person").where(name="George Washington").execute()
+
+# Traverse 2 hops from a node
+results = graph.query().traverse(source_id=node_id, depth=2).execute()
+
+# Paginate and order results
+results = graph.query().match(type="Person").order_by("name").limit(10).offset(0).execute()
+
+# Query edges from Person nodes
+edges = graph.query().match(type="Person").edges().execute()
+```
 
 ### Example Usage
 ```python
@@ -314,7 +326,7 @@ SearchResult(
 | Method | Description |
 |--------|-------------|
 | `connected_nodes(node_id: uuid.UUID) -> list[Node]` | Retrieve all nodes connected to a given node. |
-| `cypher(cypher_query)` | Execute a Cypher-like query. |
+| `query() -> QueryBuilder` | Return a fluent query builder for composable, parameterized queries. |
 
 ### Import / Export
 

@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from typing import Any, Dict, List, Union, List
 
-from graphmemory.models import Edge, NearestNode, Node, SearchResult
+from graphmemory.models import Edge, NearestNode, Node, RetrievalContext, RetrievalResult, SearchResult, TraversalResult
 
 logger = logging.getLogger(__name__)
 
@@ -734,126 +734,15 @@ class GraphMemory:
         if edges:
             self.bulk_insert_edges(edges)
 
-    def cypher(self, cypher_query):
-        sql_query = self._cypher_to_sql(cypher_query)
-        with self._lock:
-            try:
-                cur = self.cursor()
-                results = cur.execute(sql_query).fetchall()
-                logger.debug(f"Query results: {results}")
-                return results
-            except duckdb.Error as e:
-                logger.error(f"Error executing SQL query: {e}")
-                return []
+    def query(self) -> 'QueryBuilder':
+        """Return a new QueryBuilder for constructing parameterized graph queries.
 
-    def _cypher_to_sql(self, cypher_query):
-        node_pattern = re.compile(r"\((\w+)(?::(\w+))?(?:\s*{([^}]+)})?\)")
-        rel_pattern = re.compile(r"\[(\w+)?(?::(\w+))?(?:\s*{([^}]+)})?\]")
+        Example::
 
-        def parse_properties(prop_string):
-            properties = {}
-            if prop_string:
-                props = prop_string.split(',')
-                for prop in props:
-                    key, value = prop.split(':')
-                    value = value.strip().strip('"\'')
-                    if value.isdigit():
-                        value = int(value)
-                    elif re.match(r"^\d+?\.\d+?$", value):
-                        value = float(value)
-                    properties[key.strip()] = value
-            return properties
-
-        match_clause = re.search(r'MATCH\s+(.*)\s+RETURN', cypher_query, re.IGNORECASE)
-        if not match_clause:
-            raise ValueError("Invalid Cypher query: missing MATCH or RETURN clause")
-        match_content = match_clause.group(1).strip()
-
-        return_clause = re.search(r'RETURN\s+(.*)', cypher_query, re.IGNORECASE)
-        if not return_clause:
-            raise ValueError("Invalid Cypher query: missing RETURN clause")
-        return_content = return_clause.group(1).strip().split(',')
-
-        elements = re.split(r'(\[.*?\])', match_content)
-
-        nodes = []
-        relationships = []
-        for elem in elements:
-            if '(' in elem:
-                match = node_pattern.search(elem)
-                if match:
-                    alias, label, prop_string = match.groups()
-                    nodes.append({
-                        "alias": alias,
-                        "label": label,
-                        "properties": parse_properties(prop_string)
-                    })
-            elif '[' in elem:
-                match = rel_pattern.search(elem)
-                if match:
-                    alias, label, prop_string = match.groups()
-                    relationships.append({
-                        "alias": alias or f"r{len(relationships)+1}",
-                        "label": label,
-                        "properties": parse_properties(prop_string)
-                    })
-
-        sql_query = "SELECT "
-        sql_parts = []
-
-        for item in return_content:
-            item = item.strip()
-            if '.' in item:
-                alias, field = item.split('.')
-                if field == "embedding":
-                    sql_parts.append(f"{alias}.{field}")
-            else:
-                sql_parts.append("*")
-
-        if not sql_parts:
-            sql_parts.append("*")
-
-        from_clause = []
-        where_conditions = []
-
-        for i, node in enumerate(nodes):
-            alias, label, properties = node.values()
-            if i == 0:
-                from_clause.append(f"nodes AS {alias}")
-            else:
-                prev_node = nodes[i-1]['alias']
-                rel = relationships[i-1]
-                rel_alias, rel_label, rel_properties = rel.values()
-                from_clause.append(f"JOIN nodes AS {alias} ON {prev_node}.id = {rel_alias}.start_node_id AND {alias}.id = {rel_alias}.end_node_id")
-
-            if label:
-                where_conditions.append(f"{alias}.type = '{label}'")
-            for prop, val in properties.items():
-                if prop == "embedding":
-                    sql_parts.append(f"{alias}.embedding")
-                else:
-                    if isinstance(val, (int, float)):
-                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json('{val}')")
-                    else:
-                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json('{json.dumps(val)}')")
-
-        for rel in relationships:
-            rel_alias, rel_label, rel_properties = rel.values()
-            if rel_label:
-                where_conditions.append(f"{rel_alias}.type = '{rel_label}'")
-            for prop, val in rel_properties.items():
-                if isinstance(val, (int, float)):
-                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json('{val}')")
-                else:
-                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json('{json.dumps(val)}')")
-
-        sql_query += ", ".join(sql_parts)
-        sql_query += " FROM " + " ".join(from_clause)
-
-        if where_conditions:
-            sql_query += " WHERE " + " AND ".join(where_conditions)
-
-        return sql_query + ";"
+            results = graph.query().match(type="Person").where(name="Alice").execute()
+            results = graph.query().match().traverse(depth=2).limit(10).execute()
+        """
+        return QueryBuilder(self)
 
     def _rebuild_fts_index(self):
         """Rebuild the FTS index on the nodes properties column only if data has changed."""
@@ -977,6 +866,214 @@ class GraphMemory:
         combined.sort(key=lambda r: r.score, reverse=True)
         return combined[:limit]
 
+    def _expand_graph(self, seed_node_ids: set[str], max_hops: int) -> tuple[dict[str, Node], list[Edge]]:
+        """Expand from seed nodes via multi-hop traversal, returning all discovered nodes and edges."""
+        visited_ids = set(seed_node_ids)
+        all_nodes: dict[str, Node] = {}
+        all_edges: list[Edge] = []
+        seen_edge_ids: set[str] = set()
+
+        for nid in seed_node_ids:
+            node = self.get_node(uuid.UUID(nid))
+            if node:
+                all_nodes[str(node.id)] = node
+
+        frontier = set(seed_node_ids)
+        for _hop in range(max_hops):
+            if not frontier:
+                break
+            next_frontier: set[str] = set()
+            for nid in frontier:
+                with self._lock:
+                    try:
+                        cur = self.cursor()
+                        rows = cur.execute(
+                            "SELECT id, source_id, target_id, relation, weight FROM edges "
+                            "WHERE source_id = ? OR target_id = ?;",
+                            (nid, nid)
+                        ).fetchall()
+                    except duckdb.Error as e:
+                        logger.error(f"Error expanding graph from node {nid}: {e}")
+                        continue
+
+                for row in rows:
+                    edge = Edge(id=row[0], source_id=row[1], target_id=row[2], relation=row[3], weight=row[4])
+                    eid = str(edge.id)
+                    if eid not in seen_edge_ids:
+                        seen_edge_ids.add(eid)
+                        all_edges.append(edge)
+
+                    neighbor_id = str(edge.target_id) if str(edge.source_id) == nid else str(edge.source_id)
+                    if neighbor_id not in visited_ids:
+                        visited_ids.add(neighbor_id)
+                        next_frontier.add(neighbor_id)
+                        neighbor_node = self.get_node(uuid.UUID(neighbor_id))
+                        if neighbor_node:
+                            all_nodes[neighbor_id] = neighbor_node
+
+            frontier = next_frontier
+
+        return all_nodes, all_edges
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~4 characters per token."""
+        return len(text) // 4
+
+    @staticmethod
+    def _format_node_context(node: Node) -> str:
+        """Format a single node into a readable context string."""
+        parts = []
+        label = f"[{node.type}]" if node.type else "[Node]"
+        parts.append(f"{label} (id: {node.id})")
+        if node.properties:
+            for key, value in node.properties.items():
+                parts.append(f"  {key}: {value}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _format_edge_context(edge: Edge, nodes: dict[str, Node]) -> str:
+        """Format an edge into a readable relationship string."""
+        source = nodes.get(str(edge.source_id))
+        target = nodes.get(str(edge.target_id))
+        source_label = (source.type or "Node") if source else "?"
+        target_label = (target.type or "Node") if target else "?"
+        relation = edge.relation or "related_to"
+        weight_str = f" (weight: {edge.weight})" if edge.weight is not None else ""
+        return f"({source_label}:{edge.source_id}) -[{relation}{weight_str}]-> ({target_label}:{edge.target_id})"
+
+    def _assemble_context(self, query: str, nodes: dict[str, Node], edges: list[Edge],
+                          seed_ids: set[str], max_tokens: int) -> RetrievalResult:
+        """Assemble nodes and edges into a prompt-ready context window respecting token limits."""
+        contexts: list[RetrievalContext] = []
+
+        # Build adjacency for hop distance calculation
+        adjacency: dict[str, list[dict[str, Any]]] = {nid: [] for nid in nodes}
+        for edge in edges:
+            sid, tid = str(edge.source_id), str(edge.target_id)
+            edge_dict = {"id": str(edge.id), "relation": edge.relation, "weight": edge.weight,
+                         "source_id": sid, "target_id": tid}
+            if sid in adjacency:
+                adjacency[sid].append(edge_dict)
+            if tid in adjacency:
+                adjacency[tid].append(edge_dict)
+
+        # BFS from seed nodes to compute hop distance
+        hop_distances: dict[str, int] = {nid: 0 for nid in seed_ids if nid in nodes}
+        bfs_queue = [nid for nid in seed_ids if nid in nodes]
+        bfs_visited = set(bfs_queue)
+        while bfs_queue:
+            current = bfs_queue.pop(0)
+            for edge_dict in adjacency.get(current, []):
+                neighbor = edge_dict["target_id"] if edge_dict["source_id"] == current else edge_dict["source_id"]
+                if neighbor not in bfs_visited and neighbor in nodes:
+                    bfs_visited.add(neighbor)
+                    hop_distances[neighbor] = hop_distances[current] + 1
+                    bfs_queue.append(neighbor)
+
+        for nid, node in nodes.items():
+            hop = hop_distances.get(nid, len(nodes))
+            node_edges = adjacency.get(nid, [])
+            contexts.append(RetrievalContext(node=node, relationships=node_edges, hop_distance=hop))
+        contexts.sort(key=lambda c: c.hop_distance)
+
+        # Assemble text respecting token limit
+        text_parts = [f"## Context for query: {query}\n"]
+        text_parts.append("### Entities\n")
+
+        included_node_ids: set[str] = set()
+        for ctx in contexts:
+            node_text = self._format_node_context(ctx.node)
+            candidate = "\n".join(text_parts) + node_text + "\n\n"
+            if self._estimate_tokens(candidate) > max_tokens:
+                break
+            text_parts.append(node_text)
+            text_parts.append("")
+            included_node_ids.add(str(ctx.node.id))
+
+        if edges:
+            rel_header = "### Relationships\n"
+            candidate = "\n".join(text_parts) + rel_header
+            if self._estimate_tokens(candidate) <= max_tokens:
+                text_parts.append(rel_header)
+                for edge in edges:
+                    if str(edge.source_id) in included_node_ids or str(edge.target_id) in included_node_ids:
+                        edge_text = self._format_edge_context(edge, nodes)
+                        candidate = "\n".join(text_parts) + edge_text + "\n"
+                        if self._estimate_tokens(candidate) > max_tokens:
+                            break
+                        text_parts.append(edge_text)
+
+        context_text = "\n".join(text_parts).strip()
+
+        return RetrievalResult(
+            query=query,
+            contexts=contexts,
+            context_text=context_text,
+            token_estimate=self._estimate_tokens(context_text),
+            seed_node_count=len(seed_ids),
+            total_node_count=len(nodes),
+        )
+
+    def retrieve(self, query: str, query_vector: list[float],
+                 max_hops: int = 2, max_tokens: int = 4000,
+                 search_limit: int = 10, text_weight: float = 0.5,
+                 vector_weight: float = 0.5) -> RetrievalResult:
+        """Full GraphRAG retrieval pipeline.
+
+        Chains: hybrid search -> graph expansion via multi-hop traversal -> context assembly.
+        """
+        search_results = self.hybrid_search(
+            query_text=query,
+            query_vector=query_vector,
+            limit=search_limit,
+            text_weight=text_weight,
+            vector_weight=vector_weight,
+        )
+
+        if not search_results:
+            return RetrievalResult(query=query)
+
+        seed_ids = {str(sr.node.id) for sr in search_results}
+        all_nodes, all_edges = self._expand_graph(seed_ids, max_hops)
+        return self._assemble_context(query, all_nodes, all_edges, seed_ids, max_tokens)
+
+    def ask(self, query: str, query_vector: list[float],
+            llm_callable: Any = None,
+            max_hops: int = 2, max_tokens: int = 4000,
+            search_limit: int = 10, text_weight: float = 0.5,
+            vector_weight: float = 0.5,
+            system_prompt: str = "Answer the question using only the provided context. "
+                                 "If the context does not contain enough information, say so.") -> dict[str, Any]:
+        """End-to-end question answering: retrieval + LLM generation.
+
+        Args:
+            query: The question to answer.
+            query_vector: Vector embedding of the query.
+            llm_callable: A callable that takes (system_prompt: str, user_prompt: str) -> str.
+                          If None, returns only the retrieval result without generation.
+        """
+        retrieval = self.retrieve(
+            query=query,
+            query_vector=query_vector,
+            max_hops=max_hops,
+            max_tokens=max_tokens,
+            search_limit=search_limit,
+            text_weight=text_weight,
+            vector_weight=vector_weight,
+        )
+
+        answer = None
+        if llm_callable is not None and retrieval.context_text:
+            user_prompt = f"{retrieval.context_text}\n\n## Question\n{query}"
+            try:
+                answer = llm_callable(system_prompt, user_prompt)
+            except Exception as e:
+                logger.error(f"LLM generation failed: {e}")
+                answer = None
+
+        return {"retrieval": retrieval, "answer": answer}
+
     def _validate_vector(self, vector):
         return isinstance(vector, list) and len(vector) == self.vector_length and all(isinstance(x, float) for x in vector)
 
@@ -1007,3 +1104,260 @@ class GraphMemory:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+
+class QueryBuilder:
+    """Fluent, composable query builder for GraphMemory.
+
+    All filters use parameterized queries to prevent SQL injection.
+    Returns typed results (list[Node], list[Edge], or list[TraversalResult]).
+
+    Example::
+
+        graph.query().match(type="Person").where(name="Alice").execute()
+        graph.query().match().where(age=30).order_by("name").limit(10).execute()
+        graph.query().match(type="Person").traverse(depth=2).execute()
+    """
+
+    _VALID_ATTR_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+    _VALID_ORDER_FIELDS = {'id', 'type'}
+
+    def __init__(self, graph: GraphMemory):
+        self._graph = graph
+        self._type: str | None = None
+        self._where_conditions: list[tuple[str, Any]] = []
+        self._traverse_depth: int | None = None
+        self._traverse_source_id: uuid.UUID | None = None
+        self._order_by_field: str | None = None
+        self._order_by_property: str | None = None
+        self._order_asc: bool = True
+        self._limit_val: int | None = None
+        self._offset_val: int | None = None
+        self._return_edges: bool = False
+
+    def match(self, type: str | None = None) -> 'QueryBuilder':
+        """Filter nodes by type label."""
+        self._type = type
+        return self
+
+    def where(self, **conditions) -> 'QueryBuilder':
+        """Add property-based WHERE conditions (parameterized)."""
+        for key, value in conditions.items():
+            if not self._VALID_ATTR_RE.match(key):
+                raise ValueError(f"Invalid attribute name: {key!r}")
+            self._where_conditions.append((key, value))
+        return self
+
+    def traverse(self, source_id: uuid.UUID | None = None, depth: int = 1) -> 'QueryBuilder':
+        """Traverse edges from a node (or all matched nodes) to a configurable depth."""
+        if depth < 1:
+            raise ValueError("Traverse depth must be >= 1")
+        self._traverse_depth = depth
+        self._traverse_source_id = source_id
+        return self
+
+    def order_by(self, field: str, ascending: bool = True) -> 'QueryBuilder':
+        """Order results by a node column ('id', 'type') or a property key."""
+        if field in self._VALID_ORDER_FIELDS:
+            self._order_by_field = field
+            self._order_by_property = None
+        else:
+            if not self._VALID_ATTR_RE.match(field):
+                raise ValueError(f"Invalid order_by field: {field!r}")
+            self._order_by_property = field
+            self._order_by_field = None
+        self._order_asc = ascending
+        return self
+
+    def limit(self, n: int) -> 'QueryBuilder':
+        """Limit the number of results."""
+        if n < 0:
+            raise ValueError("Limit must be >= 0")
+        self._limit_val = n
+        return self
+
+    def offset(self, n: int) -> 'QueryBuilder':
+        """Skip the first n results."""
+        if n < 0:
+            raise ValueError("Offset must be >= 0")
+        self._offset_val = n
+        return self
+
+    def edges(self) -> 'QueryBuilder':
+        """Return edges instead of nodes."""
+        self._return_edges = True
+        return self
+
+    def execute(self) -> list[Node] | list[Edge] | list[TraversalResult]:
+        """Execute the query and return typed results."""
+        if self._traverse_depth is not None:
+            return self._execute_traversal()
+        if self._return_edges:
+            return self._execute_edges()
+        return self._execute_nodes()
+
+    def _execute_nodes(self) -> list[Node]:
+        query = "SELECT id, type, properties, vector FROM nodes"
+        params: list[Any] = []
+        where_parts: list[str] = []
+
+        if self._type is not None:
+            where_parts.append("type = ?")
+            params.append(self._type)
+
+        for attr, value in self._where_conditions:
+            where_parts.append(f"json_extract(properties, '$.{attr}') = ?")
+            params.append(json.dumps(value))
+
+        if where_parts:
+            query += " WHERE " + " AND ".join(where_parts)
+
+        if self._order_by_field:
+            query += f" ORDER BY {self._order_by_field}"
+            query += " ASC" if self._order_asc else " DESC"
+        elif self._order_by_property:
+            query += f" ORDER BY json_extract(properties, '$.{self._order_by_property}')"
+            query += " ASC" if self._order_asc else " DESC"
+
+        if self._limit_val is not None:
+            query += " LIMIT ?"
+            params.append(self._limit_val)
+        if self._offset_val is not None:
+            query += " OFFSET ?"
+            params.append(self._offset_val)
+
+        query += ";"
+
+        with self._graph._lock:
+            try:
+                cur = self._graph.cursor()
+                rows = cur.execute(query, params).fetchall()
+                return [
+                    Node(id=row[0], type=row[1], properties=json.loads(row[2]), vector=row[3])
+                    for row in rows
+                ]
+            except duckdb.Error as e:
+                logger.error(f"Error executing query: {e}")
+                return []
+
+    def _execute_edges(self) -> list[Edge]:
+        query = "SELECT e.id, e.source_id, e.target_id, e.relation, e.weight FROM edges e"
+        params: list[Any] = []
+        where_parts: list[str] = []
+
+        if self._type is not None or self._where_conditions:
+            query += " JOIN nodes n ON e.source_id = n.id"
+            if self._type is not None:
+                where_parts.append("n.type = ?")
+                params.append(self._type)
+            for attr, value in self._where_conditions:
+                where_parts.append(f"json_extract(n.properties, '$.{attr}') = ?")
+                params.append(json.dumps(value))
+
+        if where_parts:
+            query += " WHERE " + " AND ".join(where_parts)
+
+        if self._limit_val is not None:
+            query += " LIMIT ?"
+            params.append(self._limit_val)
+        if self._offset_val is not None:
+            query += " OFFSET ?"
+            params.append(self._offset_val)
+
+        query += ";"
+
+        with self._graph._lock:
+            try:
+                cur = self._graph.cursor()
+                rows = cur.execute(query, params).fetchall()
+                return [
+                    Edge(id=row[0], source_id=row[1], target_id=row[2], relation=row[3], weight=row[4])
+                    for row in rows
+                ]
+            except duckdb.Error as e:
+                logger.error(f"Error executing edge query: {e}")
+                return []
+
+    def _execute_traversal(self) -> list[TraversalResult]:
+        source_ids = self._resolve_source_ids()
+        if not source_ids:
+            return []
+
+        visited: dict[str, tuple[int, list[uuid.UUID]]] = {}
+        for sid in source_ids:
+            visited[str(sid)] = (0, [sid])
+
+        current_level = list(source_ids)
+        for depth in range(1, self._traverse_depth + 1):
+            if not current_level:
+                break
+            placeholders = ', '.join(['?'] * len(current_level))
+            id_strs = [str(nid) for nid in current_level]
+            query = f"""
+            SELECT DISTINCT target_id, source_id FROM edges WHERE source_id IN ({placeholders})
+            UNION
+            SELECT DISTINCT source_id, target_id FROM edges WHERE target_id IN ({placeholders})
+            """
+            with self._graph._lock:
+                try:
+                    cur = self._graph.cursor()
+                    rows = cur.execute(query, id_strs + id_strs).fetchall()
+                except duckdb.Error as e:
+                    logger.error(f"Error during traversal: {e}")
+                    break
+
+            next_level = []
+            for row in rows:
+                neighbor_id = row[0]
+                parent_id = str(row[1])
+                nid_str = str(neighbor_id)
+                if nid_str not in visited:
+                    parent_path = visited.get(parent_id, (0, []))[1]
+                    visited[nid_str] = (depth, parent_path + [neighbor_id])
+                    next_level.append(neighbor_id)
+            current_level = next_level
+
+        source_id_strs = {str(sid) for sid in source_ids}
+        result_entries = [
+            (nid_str, depth, path)
+            for nid_str, (depth, path) in visited.items()
+            if nid_str not in source_id_strs
+        ]
+
+        if not result_entries:
+            return []
+
+        result_id_strs = [entry[0] for entry in result_entries]
+        placeholders = ', '.join(['?'] * len(result_id_strs))
+        node_query = f"SELECT id, type, properties, vector FROM nodes WHERE id IN ({placeholders});"
+        with self._graph._lock:
+            try:
+                cur = self._graph.cursor()
+                rows = cur.execute(node_query, result_id_strs).fetchall()
+            except duckdb.Error as e:
+                logger.error(f"Error fetching traversal nodes: {e}")
+                return []
+
+        node_map = {
+            str(row[0]): Node(id=row[0], type=row[1], properties=json.loads(row[2]), vector=row[3])
+            for row in rows
+        }
+
+        results = []
+        for nid_str, depth, path in result_entries:
+            if nid_str in node_map:
+                results.append(TraversalResult(node=node_map[nid_str], depth=depth, path=path))
+
+        results.sort(key=lambda r: r.depth)
+
+        if self._offset_val is not None:
+            results = results[self._offset_val:]
+        if self._limit_val is not None:
+            results = results[:self._limit_val]
+
+        return results
+
+    def _resolve_source_ids(self) -> list[uuid.UUID]:
+        if self._traverse_source_id is not None:
+            return [self._traverse_source_id]
+        return [n.id for n in self._execute_nodes()]

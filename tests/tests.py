@@ -368,48 +368,164 @@ class TestEdgeQueryMethods(unittest.TestCase):
         self.db.conn.close()
 
 
-class TestCypherToSQL(unittest.TestCase):
-    node_id = None
+class TestQueryBuilder(unittest.TestCase):
 
     def setUp(self):
-        # Set up the graph and logger if necessary
         self.graph = GraphMemory(database=":memory:", vector_length=3)
-        example_node = Node(properties={"name": "George Washington", "age": 57}, type="Person")
-        logger.info(f"Inserted Node ID: {self.node_id}")
-        self.node_id = self.graph.insert_node(example_node)
-        print("*****", self.node_id)
+        self.node1 = Node(properties={"name": "George Washington", "age": 57}, type="Person", vector=[0.1, 0.2, 0.3])
+        self.node2 = Node(properties={"name": "John Adams", "age": 61}, type="Person", vector=[0.4, 0.5, 0.6])
+        self.node3 = Node(properties={"name": "Acme Corp"}, type="Company", vector=[0.7, 0.8, 0.9])
+        self.node1_id = self.graph.insert_node(self.node1)
+        self.node2_id = self.graph.insert_node(self.node2)
+        self.node3_id = self.graph.insert_node(self.node3)
+        self.graph.insert_edge(Edge(source_id=self.node1_id, target_id=self.node2_id, relation="knows", weight=1.0))
+        self.graph.insert_edge(Edge(source_id=self.node1_id, target_id=self.node3_id, relation="works_at", weight=0.8))
 
-    def test_if_node_is_inserted(self):
-        result = self.graph.get_node(self.node_id)
-        self.assertIsNotNone(result)
+    def test_match_by_type(self):
+        results = self.graph.query().match(type="Person").execute()
+        self.assertEqual(len(results), 2)
+        types = {r.type for r in results}
+        self.assertEqual(types, {"Person"})
 
-    def test_cypher_to_sql(self):
-        example_node = Node(properties={"name": "George Washington", "age": 57}, type="Person")
-        self.node_id = self.graph.insert_node(example_node)
+    def test_where_single_condition(self):
+        results = self.graph.query().match(type="Person").where(name="George Washington").execute()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].properties["name"], "George Washington")
 
-        cypher_query = "MATCH (n:Person {name: 'George Washington', age: 57}) RETURN n"
-        expected_sql_query = (
-            "SELECT * "
-            "FROM nodes AS n "
-            "WHERE n.type = 'Person' "
-            "AND json_extract(n.properties, '$.name') = json('\"George Washington\"') "
-            "AND json_extract(n.properties, '$.age') = json('57');"
+    def test_where_multiple_conditions(self):
+        results = self.graph.query().match(type="Person").where(name="George Washington", age=57).execute()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].id, self.node1_id)
+
+    def test_where_no_match(self):
+        results = self.graph.query().match(type="Person").where(name="Nobody").execute()
+        self.assertEqual(len(results), 0)
+
+    def test_match_all_nodes(self):
+        results = self.graph.query().match().execute()
+        self.assertEqual(len(results), 3)
+
+    def test_limit(self):
+        results = self.graph.query().match().limit(2).execute()
+        self.assertEqual(len(results), 2)
+
+    def test_offset(self):
+        all_results = self.graph.query().match().execute()
+        offset_results = self.graph.query().match().offset(1).execute()
+        self.assertEqual(len(offset_results), len(all_results) - 1)
+
+    def test_limit_and_offset(self):
+        results = self.graph.query().match().limit(1).offset(1).execute()
+        self.assertEqual(len(results), 1)
+
+    def test_order_by_type(self):
+        results = self.graph.query().match().order_by("type").execute()
+        types = [r.type for r in results]
+        self.assertEqual(types, sorted(types))
+
+    def test_order_by_property(self):
+        results = self.graph.query().match(type="Person").order_by("name").execute()
+        names = [r.properties["name"] for r in results]
+        self.assertEqual(names, sorted(names))
+
+    def test_order_by_descending(self):
+        results = self.graph.query().match(type="Person").order_by("name", ascending=False).execute()
+        names = [r.properties["name"] for r in results]
+        self.assertEqual(names, sorted(names, reverse=True))
+
+    def test_traverse_depth_1(self):
+        results = self.graph.query().traverse(source_id=self.node1_id, depth=1).execute()
+        result_ids = {r.node.id for r in results}
+        self.assertIn(self.node2_id, result_ids)
+        self.assertIn(self.node3_id, result_ids)
+        for r in results:
+            self.assertEqual(r.depth, 1)
+
+    def test_traverse_depth_2(self):
+        results = self.graph.query().traverse(source_id=self.node2_id, depth=2).execute()
+        result_ids = {r.node.id for r in results}
+        self.assertIn(self.node1_id, result_ids)
+        self.assertIn(self.node3_id, result_ids)
+
+    def test_traverse_with_match_filter(self):
+        results = self.graph.query().match(type="Person").where(name="George Washington").traverse(depth=1).execute()
+        result_ids = {r.node.id for r in results}
+        self.assertIn(self.node2_id, result_ids)
+        self.assertIn(self.node3_id, result_ids)
+
+    def test_traverse_limit(self):
+        results = self.graph.query().traverse(source_id=self.node1_id, depth=1).limit(1).execute()
+        self.assertEqual(len(results), 1)
+
+    def test_edges_query(self):
+        results = self.graph.query().edges().execute()
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0], Edge)
+
+    def test_edges_with_type_filter(self):
+        results = self.graph.query().match(type="Person").edges().execute()
+        self.assertGreater(len(results), 0)
+        for edge in results:
+            self.assertIsInstance(edge, Edge)
+
+    def test_edges_limit(self):
+        results = self.graph.query().edges().limit(1).execute()
+        self.assertEqual(len(results), 1)
+
+    def test_chainable(self):
+        results = (
+            self.graph.query()
+            .match(type="Person")
+            .where(name="George Washington")
+            .order_by("name")
+            .limit(10)
+            .offset(0)
+            .execute()
         )
+        self.assertEqual(len(results), 1)
 
-        sql_query = self.graph._cypher_to_sql(cypher_query)
-        logger.info(f"Generated SQL Query: {sql_query}")
-        self.assertEqual(sql_query.strip(), expected_sql_query.strip())
+    def test_returns_typed_nodes(self):
+        results = self.graph.query().match(type="Person").execute()
+        for r in results:
+            self.assertIsInstance(r, Node)
 
-    def test_cypher_method(self):
-        # Use the cypher method to query the node
-        cypher_query = "MATCH (n:Person {name: 'George Washington', age: 57}) RETURN n"
-        logger.info(f"Executing Cypher query: {cypher_query}")
-        result = self.graph.cypher(cypher_query)
-        logger.info(f"Query result: {result}")
+    def test_where_invalid_attribute_rejected(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().where(**{"invalid name": "test"})
 
-        # Check if the result is as expected
-        self.assertEqual(len(result), 1, f"Expected 1 result, but got {len(result)}")
-        self.assertEqual(str(result[0][0]), str(self.node_id))  # Convert UUID to string for comparison
+    def test_where_sql_injection_rejected(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().where(**{"name'; DROP TABLE nodes;--": "test"})
+
+    def test_order_by_invalid_field_rejected(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().order_by("invalid field!")
+
+    def test_traverse_invalid_depth(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().traverse(depth=0)
+
+    def test_limit_negative(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().limit(-1)
+
+    def test_offset_negative(self):
+        with self.assertRaises(ValueError):
+            self.graph.query().offset(-1)
+
+    def test_traverse_returns_traversal_results(self):
+        from graphmemory.models import TraversalResult
+        results = self.graph.query().traverse(source_id=self.node1_id, depth=1).execute()
+        for r in results:
+            self.assertIsInstance(r, TraversalResult)
+            self.assertIsInstance(r.node, Node)
+            self.assertGreater(r.depth, 0)
+            self.assertIsInstance(r.path, list)
+
+    def test_traverse_path_includes_node(self):
+        results = self.graph.query().traverse(source_id=self.node1_id, depth=1).execute()
+        for r in results:
+            self.assertIn(r.node.id, r.path)
 
     def tearDown(self):
         self.graph.conn.close()
@@ -1341,42 +1457,39 @@ class TestInsertNodeWithoutVector(unittest.TestCase):
         self.db.conn.close()
 
 
-class TestCypherEdgeCases(unittest.TestCase):
+class TestQueryBuilderEdgeCases(unittest.TestCase):
     def setUp(self):
         self.db = GraphMemory(database=":memory:", vector_length=3)
+        self.node = Node(properties={"name": "test", "price": 9.99}, type="Item", vector=[0.1, 0.2, 0.3])
+        self.db.insert_node(self.node)
 
-    def test_cypher_invalid_query_no_match(self):
-        with self.assertRaises(ValueError):
-            self.db._cypher_to_sql("RETURN n")
+    def test_where_with_float(self):
+        results = self.db.query().match(type="Item").where(price=9.99).execute()
+        self.assertEqual(len(results), 1)
 
-    def test_cypher_invalid_query_no_return(self):
-        with self.assertRaises(ValueError):
-            self.db._cypher_to_sql("MATCH (n)")
+    def test_where_with_int(self):
+        self.db.insert_node(Node(properties={"count": 42}, type="Counter", vector=[0.1, 0.2, 0.3]))
+        results = self.db.query().match(type="Counter").where(count=42).execute()
+        self.assertEqual(len(results), 1)
 
-    def test_cypher_with_float_property(self):
-        sql = self.db._cypher_to_sql("MATCH (n:Item {price: 9.99}) RETURN n")
-        self.assertIn("json('9.99')", sql)
+    def test_empty_query(self):
+        results = self.db.query().execute()
+        self.assertGreater(len(results), 0)
 
-    def test_cypher_with_embedding_return(self):
-        sql = self.db._cypher_to_sql("MATCH (n:Person) RETURN n.embedding")
-        self.assertIn("n.embedding", sql)
+    def test_match_nonexistent_type(self):
+        results = self.db.query().match(type="NonExistent").execute()
+        self.assertEqual(len(results), 0)
 
-    def test_cypher_with_relationship(self):
-        sql = self.db._cypher_to_sql("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, b")
-        self.assertIn("JOIN", sql)
-        self.assertIn("r.type = 'KNOWS'", sql)
+    def test_traverse_nonexistent_source(self):
+        results = self.db.query().traverse(source_id=uuid.uuid4(), depth=1).execute()
+        self.assertEqual(len(results), 0)
 
-    def test_cypher_with_relationship_properties(self):
-        sql = self.db._cypher_to_sql("MATCH (a:Person)-[r:KNOWS {since: 2020}]->(b:Person) RETURN a, b")
-        self.assertIn("json('2020')", sql)
-
-    def test_cypher_with_string_relationship_property(self):
-        sql = self.db._cypher_to_sql("MATCH (a:Person)-[r:KNOWS {type: 'close'}]->(b:Person) RETURN a, b")
-        self.assertIn("json('\"close\"')", sql)
-
-    def test_cypher_with_embedding_property(self):
-        sql = self.db._cypher_to_sql("MATCH (n:Person {embedding: 'test'}) RETURN n")
-        self.assertIn("n.embedding", sql)
+    def test_query_after_close(self):
+        db = GraphMemory(database=":memory:", vector_length=3)
+        db.insert_node(Node(properties={"name": "test"}, vector=[0.1, 0.2, 0.3]))
+        db.close()
+        results = db.query().execute()
+        self.assertEqual(results, [])
 
     def tearDown(self):
         self.db.conn.close()
@@ -1517,12 +1630,6 @@ class TestClosedConnectionErrors(unittest.TestCase):
         db = GraphMemory(database=":memory:", vector_length=3)
         db.conn.close()
         result = db.get_nodes_vector(uuid.uuid4())
-        self.assertEqual(result, [])
-
-    def test_cypher_after_close(self):
-        db = GraphMemory(database=":memory:", vector_length=3)
-        db.conn.close()
-        result = db.cypher("MATCH (n:Person) RETURN n")
         self.assertEqual(result, [])
 
     def test_create_index_after_close(self):
@@ -1962,6 +2069,241 @@ class TestAlgorithms(unittest.TestCase):
         self.assertEqual(betweenness_centrality(empty_db), {})
         self.assertEqual(degree_distribution(empty_db), {})
         self.assertEqual(connected_components(empty_db), [])
+
+
+class TestRetrieve(unittest.TestCase):
+    """Tests for the retrieve() GraphRAG retrieval pipeline."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+        # Build a small graph:
+        # Washington -[served_under]-> Continental Congress
+        # Washington -[commanded]-> Continental Army
+        # Continental Army -[fought_in]-> Battle of Yorktown
+        # Jefferson -[drafted]-> Declaration of Independence
+        self.washington = Node(properties={"name": "George Washington", "role": "General"}, type="Person", vector=[1.0, 0.0, 0.0])
+        self.congress = Node(properties={"name": "Continental Congress", "established": 1774}, type="Organization", vector=[0.9, 0.1, 0.0])
+        self.army = Node(properties={"name": "Continental Army", "founded": 1775}, type="Organization", vector=[0.8, 0.2, 0.0])
+        self.battle = Node(properties={"name": "Battle of Yorktown", "year": 1781}, type="Event", vector=[0.7, 0.3, 0.0])
+        self.jefferson = Node(properties={"name": "Thomas Jefferson", "role": "Statesman"}, type="Person", vector=[0.0, 1.0, 0.0])
+        self.declaration = Node(properties={"name": "Declaration of Independence", "year": 1776}, type="Document", vector=[0.0, 0.9, 0.1])
+
+        for node in [self.washington, self.congress, self.army, self.battle, self.jefferson, self.declaration]:
+            self.db.insert_node(node)
+
+        self.db.insert_edge(Edge(source_id=self.washington.id, target_id=self.congress.id, relation="served_under"))
+        self.db.insert_edge(Edge(source_id=self.washington.id, target_id=self.army.id, relation="commanded"))
+        self.db.insert_edge(Edge(source_id=self.army.id, target_id=self.battle.id, relation="fought_in"))
+        self.db.insert_edge(Edge(source_id=self.jefferson.id, target_id=self.declaration.id, relation="drafted"))
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_retrieve_returns_retrieval_result(self):
+        from graphmemory.models import RetrievalResult
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0])
+        self.assertIsInstance(result, RetrievalResult)
+        self.assertEqual(result.query, "Washington")
+
+    def test_retrieve_finds_seed_nodes(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=0)
+        self.assertGreater(result.seed_node_count, 0)
+
+    def test_retrieve_expands_via_graph_traversal(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=2, search_limit=1, vector_weight=1.0, text_weight=0.0)
+        # With only 1 seed node, expansion should find more via graph traversal
+        self.assertGreater(result.total_node_count, result.seed_node_count)
+
+    def test_retrieve_includes_relationships(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=1)
+        self.assertIn("Relationships", result.context_text)
+
+    def test_retrieve_context_text_is_nonempty(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0])
+        self.assertGreater(len(result.context_text), 0)
+        self.assertIn("Context for query", result.context_text)
+
+    def test_retrieve_empty_query_returns_empty(self):
+        result = self.db.retrieve(query="", query_vector=[0.5, 0.5, 0.5])
+        # Empty text query still does vector search via hybrid_search
+        # But if no results, should return empty
+        self.assertIsNotNone(result)
+
+    def test_retrieve_respects_max_tokens(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_tokens=50)
+        self.assertLessEqual(result.token_estimate, 50)
+
+    def test_retrieve_max_hops_zero_no_expansion(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=0)
+        # With 0 hops, total nodes should equal seed nodes
+        self.assertEqual(result.total_node_count, result.seed_node_count)
+
+    def test_retrieve_hop_distances_correct(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=2, search_limit=1, vector_weight=1.0, text_weight=0.0)
+        # Seed nodes should have hop_distance 0
+        distances = {str(ctx.node.id): ctx.hop_distance for ctx in result.contexts}
+        # Washington should be a seed (closest vector)
+        self.assertEqual(distances.get(str(self.washington.id), -1), 0)
+
+    def test_retrieve_contexts_sorted_by_hop(self):
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=2)
+        hops = [ctx.hop_distance for ctx in result.contexts]
+        self.assertEqual(hops, sorted(hops))
+
+    def test_retrieve_multi_hop_reaches_distant_nodes(self):
+        # Battle of Yorktown is 2 hops from Washington: Washington -> Army -> Battle
+        result = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], max_hops=2, search_limit=1, vector_weight=1.0, text_weight=0.0)
+        node_ids = {str(ctx.node.id) for ctx in result.contexts}
+        self.assertIn(str(self.battle.id), node_ids)
+
+    def test_retrieve_search_limit(self):
+        result1 = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], search_limit=1, max_hops=0, vector_weight=1.0, text_weight=0.0)
+        result2 = self.db.retrieve(query="Washington", query_vector=[1.0, 0.0, 0.0], search_limit=5, max_hops=0, vector_weight=1.0, text_weight=0.0)
+        self.assertLessEqual(result1.seed_node_count, 1)
+        self.assertLessEqual(result2.seed_node_count, 5)
+
+
+class TestAsk(unittest.TestCase):
+    """Tests for the ask() end-to-end question answering method."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+        node = Node(properties={"name": "George Washington", "role": "First President"}, type="Person", vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_ask_without_llm_returns_none_answer(self):
+        result = self.db.ask(query="Who was Washington?", query_vector=[1.0, 0.0, 0.0])
+        self.assertIsNone(result["answer"])
+        self.assertIsNotNone(result["retrieval"])
+
+    def test_ask_with_llm_callable(self):
+        def fake_llm(system_prompt, user_prompt):
+            return f"Answer based on context"
+
+        result = self.db.ask(query="Who was Washington?", query_vector=[1.0, 0.0, 0.0], llm_callable=fake_llm)
+        self.assertEqual(result["answer"], "Answer based on context")
+        self.assertIsNotNone(result["retrieval"])
+
+    def test_ask_llm_receives_context(self):
+        captured = {}
+
+        def capture_llm(system_prompt, user_prompt):
+            captured["system"] = system_prompt
+            captured["user"] = user_prompt
+            return "ok"
+
+        self.db.ask(query="Who was Washington?", query_vector=[1.0, 0.0, 0.0], llm_callable=capture_llm)
+        self.assertIn("Washington", captured["user"])
+        self.assertIn("Context for query", captured["user"])
+        self.assertIn("Question", captured["user"])
+
+    def test_ask_custom_system_prompt(self):
+        captured = {}
+
+        def capture_llm(system_prompt, user_prompt):
+            captured["system"] = system_prompt
+            return "ok"
+
+        self.db.ask(query="test", query_vector=[1.0, 0.0, 0.0], llm_callable=capture_llm, system_prompt="Custom prompt")
+        self.assertEqual(captured["system"], "Custom prompt")
+
+    def test_ask_llm_exception_returns_none_answer(self):
+        def failing_llm(system_prompt, user_prompt):
+            raise RuntimeError("LLM failed")
+
+        result = self.db.ask(query="test", query_vector=[1.0, 0.0, 0.0], llm_callable=failing_llm)
+        self.assertIsNone(result["answer"])
+        self.assertIsNotNone(result["retrieval"])
+
+    def test_ask_returns_dict_with_expected_keys(self):
+        result = self.db.ask(query="test", query_vector=[1.0, 0.0, 0.0])
+        self.assertIn("retrieval", result)
+        self.assertIn("answer", result)
+
+
+class TestExpandGraph(unittest.TestCase):
+    """Tests for the _expand_graph internal method."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+        self.n1 = Node(properties={"name": "A"}, vector=[1.0, 0.0, 0.0])
+        self.n2 = Node(properties={"name": "B"}, vector=[0.0, 1.0, 0.0])
+        self.n3 = Node(properties={"name": "C"}, vector=[0.0, 0.0, 1.0])
+        self.n4 = Node(properties={"name": "D"}, vector=[0.5, 0.5, 0.0])
+        for n in [self.n1, self.n2, self.n3, self.n4]:
+            self.db.insert_node(n)
+        # A -> B -> C, A -> D
+        self.db.insert_edge(Edge(source_id=self.n1.id, target_id=self.n2.id, relation="r1"))
+        self.db.insert_edge(Edge(source_id=self.n2.id, target_id=self.n3.id, relation="r2"))
+        self.db.insert_edge(Edge(source_id=self.n1.id, target_id=self.n4.id, relation="r3"))
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_expand_zero_hops(self):
+        nodes, edges = self.db._expand_graph({str(self.n1.id)}, max_hops=0)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(edges), 0)
+
+    def test_expand_one_hop(self):
+        nodes, edges = self.db._expand_graph({str(self.n1.id)}, max_hops=1)
+        node_ids = set(nodes.keys())
+        self.assertIn(str(self.n1.id), node_ids)
+        self.assertIn(str(self.n2.id), node_ids)
+        self.assertIn(str(self.n4.id), node_ids)
+        # C is 2 hops away, should not be included
+        self.assertNotIn(str(self.n3.id), node_ids)
+        self.assertGreater(len(edges), 0)
+
+    def test_expand_two_hops(self):
+        nodes, edges = self.db._expand_graph({str(self.n1.id)}, max_hops=2)
+        node_ids = set(nodes.keys())
+        # All nodes should be reachable in 2 hops
+        self.assertEqual(len(node_ids), 4)
+
+    def test_expand_no_duplicate_edges(self):
+        nodes, edges = self.db._expand_graph({str(self.n1.id)}, max_hops=2)
+        edge_ids = [str(e.id) for e in edges]
+        self.assertEqual(len(edge_ids), len(set(edge_ids)))
+
+
+class TestContextAssembly(unittest.TestCase):
+    """Tests for context assembly and formatting."""
+
+    def setUp(self):
+        self.db = GraphMemory(database=":memory:", vector_length=3)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_format_node_with_type(self):
+        node = Node(properties={"name": "Alice"}, type="Person", vector=[1.0, 0.0, 0.0])
+        text = GraphMemory._format_node_context(node)
+        self.assertIn("[Person]", text)
+        self.assertIn("name: Alice", text)
+
+    def test_format_node_without_type(self):
+        node = Node(properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        text = GraphMemory._format_node_context(node)
+        self.assertIn("[Node]", text)
+
+    def test_format_edge(self):
+        n1 = Node(type="Person", properties={}, vector=[1.0, 0.0, 0.0])
+        n2 = Node(type="Organization", properties={}, vector=[0.0, 1.0, 0.0])
+        edge = Edge(source_id=n1.id, target_id=n2.id, relation="works_at", weight=0.9)
+        nodes = {str(n1.id): n1, str(n2.id): n2}
+        text = GraphMemory._format_edge_context(edge, nodes)
+        self.assertIn("Person", text)
+        self.assertIn("Organization", text)
+        self.assertIn("works_at", text)
+        self.assertIn("weight: 0.9", text)
+
+    def test_estimate_tokens(self):
+        text = "a" * 400
+        self.assertEqual(GraphMemory._estimate_tokens(text), 100)
 
 
 if __name__ == '__main__':
