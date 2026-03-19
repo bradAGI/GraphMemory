@@ -26,8 +26,17 @@ Vector embeddings can be created using [sentence-transformers](https://www.sbert
 - **Context Manager** — Use `with` statements for automatic resource cleanup
 
 ## Installation
+
+### From PyPI
 ```sh
 pip install graphmemory
+```
+
+### From Source (Development)
+```sh
+git clone https://github.com/bradAGI/GraphMemory.git
+cd GraphMemory
+pip install -e .
 ```
 
 ## Usage
