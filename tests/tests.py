@@ -265,14 +265,16 @@ class TestCypherToSQL(unittest.TestCase):
         expected_sql_query = (
             "SELECT * "
             "FROM nodes AS n "
-            "WHERE n.type = 'Person' "
-            "AND json_extract(n.properties, '$.name') = json('\"George Washington\"') "
-            "AND json_extract(n.properties, '$.age') = json('57');"
+            "WHERE n.type = ? "
+            "AND json_extract(n.properties, '$.name') = json(?) "
+            "AND json_extract(n.properties, '$.age') = json(?);"
         )
+        expected_params = ["Person", '"George Washington"', "57"]
 
-        sql_query = self.graph._cypher_to_sql(cypher_query)
+        sql_query, params = self.graph._cypher_to_sql(cypher_query)
         logger.info(f"Generated SQL Query: {sql_query}")
         self.assertEqual(sql_query.strip(), expected_sql_query.strip())
+        self.assertEqual(params, expected_params)
 
     def test_cypher_method(self):
         # Use the cypher method to query the node
@@ -287,6 +289,64 @@ class TestCypherToSQL(unittest.TestCase):
 
     def tearDown(self):
         self.graph.conn.close()
+
+class TestCypherSQLInjection(unittest.TestCase):
+    """Tests to verify SQL injection payloads are safely parameterized."""
+
+    def setUp(self):
+        self.graph = GraphMemory(database=':memory:', vector_length=3)
+        node = Node(properties={"name": "Alice", "age": 30}, type="Person")
+        self.node_id = self.graph.insert_node(node)
+
+    def test_injection_in_property_value_drop_table(self):
+        """Property value containing DROP TABLE should be treated as literal data."""
+        cypher = "MATCH (n:Person {name: \"'); DROP TABLE nodes; --\"}) RETURN n"
+        results = self.graph.cypher(cypher)
+        self.assertEqual(results, [])
+        # Verify nodes table still exists and data is intact
+        count = self.graph.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_injection_in_property_value_union_attack(self):
+        """UNION-based injection in property value should be treated as literal."""
+        cypher = "MATCH (n:Person {name: \"' UNION SELECT * FROM nodes --\"}) RETURN n"
+        results = self.graph.cypher(cypher)
+        self.assertEqual(results, [])
+
+    def test_injection_in_property_value_quote_escape(self):
+        """Quote escapes in property values should not break out of parameterization."""
+        cypher = "MATCH (n:Person {name: \"\\' OR 1=1 --\"}) RETURN n"
+        results = self.graph.cypher(cypher)
+        self.assertEqual(results, [])
+
+    def test_injection_in_property_value_semicolon(self):
+        """Semicolon-based multi-statement injection should be safely handled."""
+        cypher = "MATCH (n:Person {name: \"Alice'; DELETE FROM nodes WHERE '1'='1\"}) RETURN n"
+        results = self.graph.cypher(cypher)
+        # Should not delete anything
+        count = self.graph.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_parameterized_query_returns_correct_results(self):
+        """Verify parameterized queries still return correct results for normal input."""
+        cypher = "MATCH (n:Person {name: 'Alice', age: 30}) RETURN n"
+        results = self.graph.cypher(cypher)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(str(results[0][0]), str(self.node_id))
+
+    def test_sql_params_are_separate_from_query(self):
+        """Verify _cypher_to_sql returns params separately, not embedded in query."""
+        cypher = "MATCH (n:Person {name: 'malicious\\' OR 1=1'}) RETURN n"
+        sql_query, params = self.graph._cypher_to_sql(cypher)
+        # The SQL query should contain ? placeholders, not the actual values
+        self.assertIn("?", sql_query)
+        self.assertNotIn("malicious", sql_query)
+        # Values should only be in params list
+        self.assertTrue(any("malicious" in str(p) for p in params))
+
+    def tearDown(self):
+        self.graph.conn.close()
+
 
 if __name__ == '__main__':
     unittest.main()

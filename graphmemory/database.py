@@ -278,23 +278,22 @@ class GraphMemory:
         print("Edges JSON:", json.dumps(edges_json, indent=2))
 
     def cypher(self, cypher_query):
-        sql_query = self._cypher_to_sql(cypher_query)
+        sql_query, params = self._cypher_to_sql(cypher_query)
         try:
-            results = self.conn.execute(sql_query).fetchall()
+            results = self.conn.execute(sql_query, params).fetchall()
             logger.debug(f"Query results: {results}")
             return results
         except duckdb.Error as e:
             logger.error(f"Error executing SQL query: {e}")
             return []
-   
+
 
     def _cypher_to_sql(self, cypher_query):
         import re
-        import json  # Added import for json
         # Define regex patterns for nodes, relationships, and properties
         node_pattern = re.compile(r"\((\w+)(?::(\w+))?(?:\s*{([^}]+)})?\)")
         rel_pattern = re.compile(r"\[(\w+)?(?::(\w+))?(?:\s*{([^}]+)})?\]")
-        
+
         # Helper function to parse properties
         def parse_properties(prop_string):
             properties = {}
@@ -350,6 +349,7 @@ class GraphMemory:
         # Start building the SQL query
         sql_query = "SELECT "
         sql_parts = []
+        params = []
 
         # Determine what is being returned
         for item in return_content:
@@ -377,27 +377,33 @@ class GraphMemory:
                 rel = relationships[i-1]
                 rel_alias, rel_label, rel_properties = rel.values()
                 from_clause.append(f"JOIN nodes AS {alias} ON {prev_node}.id = {rel_alias}.start_node_id AND {alias}.id = {rel_alias}.end_node_id")
-            
+
             if label:
-                where_conditions.append(f"{alias}.type = '{label}'")
+                where_conditions.append(f"{alias}.type = ?")
+                params.append(label)
             for prop, val in properties.items():
                 if prop == "embedding":
                     sql_parts.append(f"{alias}.embedding")
                 else:
                     if isinstance(val, (int, float)):
-                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json('{val}')")
+                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json(?)")
+                        params.append(str(val))
                     else:
-                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json('{json.dumps(val)}')")
-        
+                        where_conditions.append(f"json_extract({alias}.properties, '$.{prop}') = json(?)")
+                        params.append(json.dumps(val))
+
         for rel in relationships:
             rel_alias, rel_label, rel_properties = rel.values()
             if rel_label:
-                where_conditions.append(f"{rel_alias}.type = '{rel_label}'")
+                where_conditions.append(f"{rel_alias}.type = ?")
+                params.append(rel_label)
             for prop, val in rel_properties.items():
                 if isinstance(val, (int, float)):
-                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json('{val}')")
+                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json(?)")
+                    params.append(str(val))
                 else:
-                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json('{json.dumps(val)}')")
+                    where_conditions.append(f"json_extract({rel_alias}.properties, '$.{prop}') = json(?)")
+                    params.append(json.dumps(val))
 
         sql_query += ", ".join(sql_parts)
         sql_query += " FROM " + " ".join(from_clause)
@@ -405,7 +411,7 @@ class GraphMemory:
         if where_conditions:
             sql_query += " WHERE " + " AND ".join(where_conditions)
 
-        return sql_query + ";"
+        return sql_query + ";", params
 
 
     def _validate_vector(self, vector):
