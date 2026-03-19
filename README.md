@@ -1,556 +1,281 @@
 [![](https://dcbadge.limes.pink/api/server/https://discord.gg/DSS3DmStV8)](https://discord.gg/DSS3DmStV8)
 
-# GraphMemory - GraphRAG Database
+# GraphMemory
 
-![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/9897dc2a-46c9-42e0-a8d3-2dcb1d93e6ae)
-
-## Overview
-An embedded graph database with vector similarity search (VSS), full-text search (BM25), and hybrid search using DuckDB. The `GraphMemory` class provides a complete API for managing nodes and edges, with a fluent query builder, graph import/export, connection pooling, and automatic retry logic.
-
-Each node has a unique ID, a JSON properties field (any arbitrary dictionary), a node type (ex: Person, Organization, etc.), and a vector of floating point values.
-
-Each edge has a unique ID, a source node ID, a target node ID, a relationship type (ex: served_under, worked_with, etc.), and a weight.
-
-This database can be used for any graph-based RAG application or knowledge graph application.
-
-Vector embeddings can be created using [sentence-transformers](https://www.sbert.net/) or other API based models.
+An embedded graph database for RAG and knowledge graph applications, powered by [DuckDB](https://duckdb.org/). Vector similarity search, full-text search, hybrid search, merge/upsert, graph traversal, and a full GraphRAG retrieval pipeline — all in a single Python package.
 
 ## Features
 
-- **Vector Similarity Search** — HNSW-indexed nearest neighbor search with L2, cosine, and inner product distance metrics
-- **Full-Text Search** — BM25-scored text search across node properties
-- **Hybrid Search** — Combined vector + text search with configurable weights
-- **GraphRAG Retrieval** — Full retrieval pipeline: hybrid search → graph expansion → context assembly → LLM Q&A
-- **Merge / Upsert** — Insert-or-update nodes by property match keys with configurable merge strategies (REPLACE, UPDATE, KEEP); edge deduplication on (source, target, relation)
-- **DSPy Extraction** — Automatic entity and relationship extraction from unstructured text using DSPy typed predictors
-- **Graph Algorithms** — PageRank, betweenness centrality, degree distribution, and connected components via NetworkX
-- **Query Builder** — Fluent, composable, parameterized query API with traversal support
-- **Graph Import/Export** — JSON, CSV, and GraphML formats
-- **Connection Pooling** — Thread-safe operations with automatic retry on transient errors
-- **Context Manager** — Use `with` statements for automatic resource cleanup
+- **Vector Search** — HNSW-indexed nearest neighbors (L2, cosine, inner product)
+- **Full-Text Search** — BM25-scored search across node properties
+- **Hybrid Search** — Combined vector + text with configurable weights
+- **GraphRAG** — Retrieval pipeline: hybrid search → graph expansion → context assembly → LLM Q&A
+- **Merge / Upsert** — Deduplicate nodes by property keys and edges by (source, target, relation)
+- **Query Builder** — Fluent, parameterized API with multi-hop traversal
+- **DSPy Extraction** — Entity/relationship extraction from text via DSPy (optional)
+- **Graph Algorithms** — PageRank, centrality, components via NetworkX (optional)
+- **Import / Export** — JSON, CSV, GraphML
+- **Thread-Safe** — Connection pooling, transactions, automatic retry with exponential backoff
 
 ## Installation
 
-### From PyPI
 ```sh
 pip install graphmemory
+
+# Optional
+pip install graphmemory[extraction]   # DSPy extraction
+pip install graphmemory[algorithms]   # NetworkX algorithms
 ```
 
-### Optional Dependencies
-```sh
-pip install graphmemory[extraction]   # DSPy-based entity/relationship extraction
-pip install graphmemory[algorithms]   # Graph algorithms via NetworkX
-```
-
-### From Source (Development)
-```sh
-git clone https://github.com/bradAGI/GraphMemory.git
-cd GraphMemory
-pip install -e .
-```
-
-## Usage
-
-### Initialization
+## Quick Start
 
 ```python
 from graphmemory import GraphMemory, Node, Edge
 
-# In-memory database
-graph_db = GraphMemory(vector_length=1536)
+graph = GraphMemory(database="graph.db", vector_length=3, distance_metric="cosine")
 
-# Persistent database with cosine distance
-graph_db = GraphMemory(
-    database='graph.db',
-    vector_length=1536,
-    distance_metric='cosine'  # 'l2', 'cosine', or 'inner_product'
-)
+# Insert nodes
+alice = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[0.1, 0.8, 0.3])
+bob = Node(type="Person", properties={"name": "Bob", "role": "manager"}, vector=[0.2, 0.7, 0.4])
+graph.insert_node(alice)
+graph.insert_node(bob)
 
-# Using context manager
-with GraphMemory(database='graph.db', vector_length=1536) as graph_db:
-    # ... operations ...
-    pass  # connection closed automatically
+# Insert edge
+graph.insert_edge(Edge(source_id=alice.id, target_id=bob.id, relation="reports_to", weight=1.0))
+
+# Vector search
+nearest = graph.nearest_nodes(vector=[0.1, 0.8, 0.3], limit=5)
+
+# Full-text search
+results = graph.search_nodes("engineer", limit=10)
+
+# Hybrid search
+results = graph.hybrid_search("engineer", query_vector=[0.1, 0.8, 0.3], text_weight=0.5, vector_weight=0.5)
+
+# Context manager
+with GraphMemory(database="graph.db", vector_length=3) as graph:
+    graph.insert_node(alice)
 ```
 
-### Auto Generated UUID
-IDs for nodes and edges are auto generated UUIDs.
+## Usage
 
 ### Query Builder
-The `GraphMemory` class provides a fluent query builder via the `query()` method. All conditions use parameterized queries for safety.
 
 ```python
-# Find all Person nodes named George Washington
-results = graph.query().match(type="Person").where(name="George Washington").execute()
+# Filter by type and properties
+results = graph.query().match(type="Person").where(role="engineer").execute()
 
-# Traverse 2 hops from a node
-results = graph.query().traverse(source_id=node_id, depth=2).execute()
+# Multi-hop traversal
+results = graph.query().traverse(source_id=alice.id, depth=2).execute()
 
-# Paginate and order results
+# Paginate and order
 results = graph.query().match(type="Person").order_by("name").limit(10).offset(0).execute()
 
-# Query edges from Person nodes
+# Query edges
 edges = graph.query().match(type="Person").edges().execute()
 ```
 
 ### Merge / Upsert
 
-Insert nodes and edges without creating duplicates. Nodes are matched by configurable property keys; edges are deduplicated on `(source_id, target_id, relation)`.
+Insert-or-update nodes matched by property keys. Edges deduplicate on `(source_id, target_id, relation)`.
 
 ```python
-from graphmemory import GraphMemory, Node, Edge, MergeStrategy
+from graphmemory import MergeStrategy
 
-graph = GraphMemory(vector_length=3)
-
-# First insert
-alice = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+# Insert if no match, update if "name" matches an existing Person node
 result = graph.merge_node(alice, match_keys=["name"])
-print(result.created)  # True — inserted
+print(result.created)  # True = inserted, False = updated
 
-# Second merge with new properties — updates instead of duplicating
-alice_v2 = Node(type="Person", properties={"name": "Alice", "role": "engineer"}, vector=[0.9, 0.1, 0.0])
-result = graph.merge_node(alice_v2, match_keys=["name"], strategy=MergeStrategy.UPDATE)
-print(result.created)      # False — updated existing
-print(result.node.properties)  # {"name": "Alice", "role": "engineer"}
+# Bulk merge with strategy
+results = graph.bulk_merge_nodes(nodes, match_keys=["name"], strategy=MergeStrategy.UPDATE)
 
-# Bulk merge
-nodes = [
-    Node(type="Person", properties={"name": "Alice", "age": 30}, vector=[1.0, 0.0, 0.0]),
-    Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0]),
-]
-results = graph.bulk_merge_nodes(nodes, match_keys=["name"])
-
-# Edge merge — dedup on (source, target, relation)
-edge = Edge(source_id=alice.id, target_id=results[1].node.id, relation="knows", weight=1.0)
-edge_result = graph.merge_edge(edge)
+# Edge merge
+result = graph.merge_edge(edge)
+results = graph.bulk_merge_edges(edges)
 ```
-
-**Merge strategies:**
 
 | Strategy | Behavior |
 |----------|----------|
-| `MergeStrategy.UPDATE` | Shallow merge: existing properties are preserved, incoming properties are added/overwritten (default) |
-| `MergeStrategy.REPLACE` | Incoming properties fully replace existing properties |
-| `MergeStrategy.KEEP` | Existing properties are kept unchanged; only new nodes are inserted |
+| `UPDATE` | Shallow merge — existing keys preserved, incoming keys added/overwritten (default) |
+| `REPLACE` | Incoming properties fully replace existing |
+| `KEEP` | Existing properties unchanged; only new nodes inserted |
 
 ### GraphRAG Retrieval
 
-Full retrieval pipeline: hybrid search → multi-hop graph expansion → token-aware context assembly → optional LLM generation.
+Full pipeline: hybrid search → multi-hop graph expansion → token-aware context assembly → LLM generation.
 
 ```python
-# Retrieve context for a query
-result = graph.retrieve(
-    query="Who leads ML at Acme?",
-    query_vector=embedding,
-    max_hops=2,
-    max_tokens=4000
-)
-print(result.context_text)     # Prompt-ready context string
-print(result.token_estimate)   # Estimated token count
+# Retrieve context
+result = graph.retrieve(query="Who leads ML?", query_vector=embedding, max_hops=2, max_tokens=4000)
+print(result.context_text)      # Prompt-ready string
+print(result.token_estimate)    # Token count estimate
 
-# End-to-end Q&A with an LLM
-answer = graph.ask(
-    query="Who leads ML at Acme?",
-    query_vector=embedding,
-    llm_callable=lambda system, user: my_llm(system, user)
-)
+# End-to-end Q&A
+answer = graph.ask(query="Who leads ML?", query_vector=embedding, llm_callable=my_llm)
 print(answer["answer"])
 ```
 
 ### DSPy Extraction
 
-The `graphmemory.extraction` module uses [DSPy](https://dspy.ai/) typed predictors to automatically extract entities (nodes) and relationships (edges) from unstructured text. Requires the `extraction` optional dependency.
+Requires `pip install graphmemory[extraction]`. Uses [DSPy](https://dspy.ai/) typed predictors to extract entities and relationships from text.
 
 ```python
-from graphmemory import GraphMemory
-from graphmemory.extraction import extract, extract_and_store
+from graphmemory.extraction import extract_and_store, extract_and_merge
 import dspy
 
-# Configure your DSPy language model
 dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"))
 
-text = """George Washington was the first President of the United States.
-Thomas Jefferson served as Secretary of State under Washington.
-Alexander Hamilton was the first Secretary of the Treasury."""
+text = """George Washington was the first President. Thomas Jefferson
+served as Secretary of State under Washington."""
 
-# Extract nodes and edges without storing
-nodes, edges = extract(text)
-for node in nodes:
-    print(f"{node.type}: {node.properties}")
+# Extract and insert (may create duplicates on repeated calls)
+nodes, edges = extract_and_store(graph, text)
 
-# Or extract and insert directly into a GraphMemory instance
-graph_db = GraphMemory(vector_length=3)
-inserted_nodes, edges = extract_and_store(graph_db, text)
+# Extract and merge (deduplicates against existing graph)
+node_results, edge_results = extract_and_merge(graph, text, match_keys=["name"])
 ```
-
-Available functions:
 
 | Function | Description |
 |----------|-------------|
-| `extract_nodes(text, sentences=None) -> list[Node]` | Extract entity nodes (proper nouns) from text. |
-| `extract_edges(text, nodes, sentences=None) -> list[Edge]` | Extract relationships between known nodes. |
-| `extract(text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract both nodes and edges in one call. |
-| `extract_and_store(graph, text, sentences=None) -> tuple[list[Node], list[Edge]]` | Extract and insert into a GraphMemory instance. |
-| `extract_and_merge(graph, text, match_keys=["name"], ...) -> tuple[list[MergeResult], list[EdgeMergeResult]]` | Extract and merge into a GraphMemory instance (deduplicates against existing data). |
+| `extract_nodes(text)` | Extract entity nodes from text |
+| `extract_edges(text, nodes)` | Extract relationships between known nodes |
+| `extract(text)` | Extract both nodes and edges |
+| `extract_and_store(graph, text)` | Extract and insert into graph |
+| `extract_and_merge(graph, text, match_keys)` | Extract and merge (deduplicated) |
 
 ### Graph Algorithms
 
-The `graphmemory.algorithms` module provides graph analysis via [NetworkX](https://networkx.org/). Requires the `algorithms` optional dependency.
+Requires `pip install graphmemory[algorithms]`. Powered by [NetworkX](https://networkx.org/).
 
 ```python
-from graphmemory import GraphMemory
 from graphmemory.algorithms import pagerank, betweenness_centrality, connected_components, to_networkx
 
-graph_db = GraphMemory(vector_length=3)
-# ... insert nodes and edges ...
-
-# Compute PageRank scores
-scores = pagerank(graph_db)
-
-# Find betweenness centrality
-centrality = betweenness_centrality(graph_db)
-
-# Get connected components
-components = connected_components(graph_db)
-
-# Export to NetworkX for custom analysis
-G = to_networkx(graph_db)
+scores = pagerank(graph)
+centrality = betweenness_centrality(graph)
+components = connected_components(graph)
+G = to_networkx(graph)  # Export to NetworkX DiGraph
 ```
-
-Available functions:
 
 | Function | Description |
 |----------|-------------|
-| `to_networkx(graph) -> nx.DiGraph` | Export a GraphMemory instance to a NetworkX DiGraph. |
-| `pagerank(graph, alpha=0.85, max_iter=100, tol=1e-6) -> dict[str, float]` | Compute PageRank for every node. |
-| `betweenness_centrality(graph, normalized=True, endpoints=False) -> dict[str, float]` | Compute betweenness centrality for every node. |
-| `degree_distribution(graph) -> dict[str, dict[str, int]]` | Compute in/out/total degree for every node. |
-| `connected_components(graph) -> list[set[str]]` | Find weakly connected components (sorted largest-first). |
+| `pagerank(graph, alpha=0.85)` | PageRank scores for all nodes |
+| `betweenness_centrality(graph)` | Betweenness centrality scores |
+| `degree_distribution(graph)` | In/out/total degree per node |
+| `connected_components(graph)` | Weakly connected components (largest first) |
+| `to_networkx(graph)` | Export to `networkx.DiGraph` |
 
-### Example Usage
+### Import / Export
+
 ```python
-from graphmemory import GraphMemory, Node, Edge
+# Export
+data = graph.export_graph(format="json")       # also: "csv", "graphml", "json_string"
 
-import json
-from openai import OpenAI
-import os
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-# Sample unstructured text
-gw_text = "George Washington was the first President of the United States and served from 1789 to 1797."
-tj_text = "Thomas Jefferson was the first Secretary of State of the United States and served from 1790 to 1793."
-ah_text = "Alexander Hamilton was the first Secretary of the Treasury of the United States and served from 1789 to 1795."
-
-# Extract structured data from unstructured text
-def extract_attributes(text):
-    return json.loads(client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Extract structured data from this text using the following attributes: \
-             name, title, country, term_start, term_end"},
-            {"role": "user", "content": text}
-        ],
-        seed=1
-    ).choices[0].message.content)
-
-# Calculate embedding for a given input
-def calculate_embedding(input_json):
-    return client.embeddings.create(
-        input=input_json,
-        model="text-embedding-3-small"
-    ).data[0].embedding
-
-gw_embedding = calculate_embedding(gw_text)
-tj_embedding = calculate_embedding(tj_text)
-ah_embedding = calculate_embedding(ah_text)
-
-# Initialize the database from disk (make sure to set vector_length correctly)
-graph_db = GraphMemory(database='graph.db', vector_length=len(gw_embedding))
-
-# Extract structured data from unstructured text
-gw_attributes = extract_attributes(gw_text)
-tj_attributes = extract_attributes(tj_text)
-ah_attributes = extract_attributes(ah_text)
-
-print(gw_attributes)
-print(tj_attributes)
-print(ah_attributes)
-
-# Output Example:
-# {
-#   'person': 'George Washington',
-#   'title': 'President',
-#   'country': 'United States',
-#   'term_start': '1789',
-#   'term_end': '1797'
-# }
-# {
-#   'person': 'Thomas Jefferson',
-#   'title': 'Secretary of State',
-#   'country': 'United States',
-#   'term_start': 1790,
-#   'term_end': 1793
-# }
-# {
-#   'person': 'Alexander Hamilton',
-#   'title': 'Secretary of the Treasury',
-#   'country': 'United States',
-#   'term_start': 1789,
-#   'term_end': 1795
-# }
-
-
-# Create nodes with UUIDs
-gw_node = Node(properties=gw_attributes, vector=gw_embedding)
-tj_node = Node(properties=tj_attributes, vector=tj_embedding)
-ah_node = Node(properties=ah_attributes, vector=ah_embedding)
-
-gw_node_id = graph_db.insert_node(gw_node)
-if gw_node_id is None:
-    raise ValueError("Failed to insert George Washington node")
-
-tj_node_id = graph_db.insert_node(tj_node)
-if tj_node_id is None:
-    raise ValueError("Failed to insert Thomas Jefferson node")
-
-ah_node_id = graph_db.insert_node(ah_node)
-if ah_node_id is None:
-    raise ValueError("Failed to insert Alexander Hamilton node")
-
-# Insert edges
-edge1 = Edge(source_id=gw_node_id, target_id=tj_node_id, relation="served_under", weight=0.5)
-edge2 = Edge(source_id=gw_node_id, target_id=ah_node_id, relation="served_under", weight=0.5)
-graph_db.insert_edge(edge1)
-graph_db.insert_edge(edge2)
-
-# Print edges
-print(graph_db.edges_to_json())
-
-# Find connected nodes
-connected_nodes = graph_db.connected_nodes(gw_node_id)
-for node in connected_nodes:
-    print("Connected Node Data:", node.properties)
-
-# Find nearest nodes by vector embedding
-nearest_nodes = graph_db.nearest_nodes(calculate_embedding("George Washington"), limit=1)
-print(nearest_nodes)
-print("Nearest Node Data:", nearest_nodes[0].node.properties)
-print("Nearest Node Distance:", nearest_nodes[0].distance)
-
-# Full-text search across node properties
-results = graph_db.search_nodes("President", limit=5)
-for result in results:
-    print(f"Found: {result.node.properties} (score: {result.score})")
-
-# Hybrid search (combines vector similarity + text search)
-results = graph_db.hybrid_search(
-    query_text="President",
-    query_vector=calculate_embedding("President of the United States"),
-    limit=5,
-    text_weight=0.5,
-    vector_weight=0.5
-)
-
-# Get node/s by attribute (Who was the Secretary of State?)
-nodes = graph_db.nodes_by_attribute("title", "Secretary of State")
-if nodes:
-    print("Node by attribute:", nodes[0].properties)
-else:
-    print("No nodes found with the attribute 'title' = 'Secretary of State'")
-
-# What is the title of the people who served under George Washington?
-for node in connected_nodes:
-    print(f"{node.properties.get('name')} - {node.properties.get('title')}")
-
-# Fetch a node by UUID
-fetched_node = graph_db.get_node(gw_node_id)
-
-# Update a node
-graph_db.update_node(gw_node_id, properties={"name": "George Washington", "title": "President"})
-
-# Delete an edge by source / target node id
-graph_db.delete_edge(edge1.source_id, edge1.target_id)
-
-# Export the graph
-graph_json = graph_db.export_graph(format='json')
-graph_csv = graph_db.export_graph(format='csv')
-graph_graphml = graph_db.export_graph(format='graphml')
+# Import
+graph.import_graph(data, format="json")
 ```
 
 ## Data Models
 
-### Node
-```python
-Node(
-    id: uuid.UUID,          # Auto-generated
-    properties: dict | None, # Arbitrary key-value pairs
-    type: str | None,        # Node type (e.g., "Person", "Organization")
-    vector: list[float] | None  # Embedding vector
-)
-```
+| Model | Fields |
+|-------|--------|
+| `Node` | `id: UUID`, `type: str`, `properties: dict`, `vector: list[float]` |
+| `Edge` | `id: UUID`, `source_id: UUID`, `target_id: UUID`, `relation: str`, `weight: float` |
+| `NearestNode` | `node: Node`, `distance: float` |
+| `SearchResult` | `node: Node`, `score: float` |
+| `TraversalResult` | `node: Node`, `depth: int`, `path: list[UUID]` |
+| `MergeResult` | `node: Node`, `created: bool` |
+| `EdgeMergeResult` | `edge: Edge`, `created: bool` |
+| `RetrievalResult` | `query: str`, `contexts: list`, `context_text: str`, `token_estimate: int` |
 
-### Edge
-```python
-Edge(
-    id: uuid.UUID,           # Auto-generated
-    source_id: uuid.UUID,    # Source node ID
-    target_id: uuid.UUID,    # Target node ID
-    relation: str | None,    # Relationship type (e.g., "served_under")
-    weight: float | None     # Edge weight
-)
-```
+All IDs are auto-generated UUIDs. All models are [Pydantic](https://docs.pydantic.dev/) `BaseModel` instances.
 
-### NearestNode
-```python
-NearestNode(
-    node: Node,       # The matched node
-    distance: float   # Distance from query vector
-)
-```
+## API Reference
 
-### SearchResult
-```python
-SearchResult(
-    node: Node,    # The matched node
-    score: float   # Relevance score
-)
-```
-
-### TraversalResult
-```python
-TraversalResult(
-    node: Node,              # The reached node
-    depth: int,              # Hops from source
-    path: list[uuid.UUID]    # Node IDs in the path from source
-)
-```
-
-### MergeResult
-```python
-MergeResult(
-    node: Node,     # The resulting node (inserted or updated)
-    created: bool   # True if inserted, False if updated
-)
-```
-
-### EdgeMergeResult
-```python
-EdgeMergeResult(
-    edge: Edge,     # The resulting edge (inserted or updated)
-    created: bool   # True if inserted, False if updated
-)
-```
-
-### RetrievalResult
-```python
-RetrievalResult(
-    query: str,                          # The original query
-    contexts: list[RetrievalContext],     # Retrieved context items ordered by relevance
-    context_text: str,                   # Assembled prompt-ready context string
-    token_estimate: int,                 # Estimated token count
-    seed_node_count: int,                # Initial nodes found by search
-    total_node_count: int                # Total nodes after graph expansion
-)
-```
-
-## GraphMemory API Reference
-
-### Initialization & Connection
+### Connection
 
 | Method | Description |
 |--------|-------------|
-| `__init__(database=None, vector_length=3, distance_metric='l2', max_retries=3, retry_base_delay=0.1)` | Initialize the database. `database`: file path or `None` for in-memory. `distance_metric`: `'l2'`, `'cosine'`, or `'inner_product'`. |
-| `close()` | Close the database connection (thread-safe). |
-| `cursor()` | Return a new DuckDB cursor for individual operations. |
-| `transaction()` | Context manager for database transactions. |
+| `GraphMemory(database=None, vector_length=3, distance_metric='l2')` | Initialize. `None` = in-memory. |
+| `close()` | Close connection (thread-safe, idempotent). |
+| `transaction()` | Context manager for atomic operations. |
 
-### Node Operations
-
-| Method | Description |
-|--------|-------------|
-| `insert_node(node: Node) -> uuid.UUID` | Insert a node and return its ID. |
-| `bulk_insert_nodes(nodes: list[Node]) -> list[Node]` | Bulk insert multiple nodes. |
-| `get_node(node_id: uuid.UUID) -> Node` | Retrieve a node by ID. |
-| `update_node(node_id: uuid.UUID, **kwargs) -> bool` | Update node fields (`type`, `properties`, `vector`). |
-| `delete_node(node_id: uuid.UUID)` | Delete a node and its associated edges. |
-| `bulk_delete_nodes(node_ids: list[uuid.UUID])` | Bulk delete multiple nodes and their edges. |
-| `nodes_by_attribute(attribute, value, limit=None, offset=None) -> list[Node]` | Query nodes by a property key-value pair. |
-| `get_nodes_vector(node_id: uuid.UUID) -> list[float]` | Retrieve the vector of a node. |
-| `nodes_to_json(limit=None, offset=None) -> list[dict]` | Export all nodes as JSON. |
-| `merge_node(node, match_keys, match_type=True, strategy=MergeStrategy.UPDATE, update_vector=True) -> MergeResult` | Insert or update a node matched by property keys. |
-| `bulk_merge_nodes(nodes, match_keys, ...) -> list[MergeResult]` | Bulk insert-or-update nodes. |
-
-### Edge Operations
+### Nodes
 
 | Method | Description |
 |--------|-------------|
-| `insert_edge(edge: Edge)` | Insert an edge between two nodes. |
-| `bulk_insert_edges(edges: list[Edge])` | Bulk insert multiple edges. |
-| `get_edge(edge_id: uuid.UUID) -> Edge \| None` | Retrieve an edge by ID. |
-| `get_edges_by_relation(relation: str) -> list[Edge]` | Get all edges with a given relation type. |
-| `edges_by_attribute(attribute: str, value) -> list[Edge]` | Query edges by attribute. |
-| `update_edge(edge_id: uuid.UUID, **kwargs) -> bool` | Update edge fields (`relation`, `weight`). |
-| `delete_edge(source_id: uuid.UUID, target_id: uuid.UUID)` | Delete an edge by source and target node IDs. |
-| `bulk_delete_edges(edge_ids: list[uuid.UUID])` | Bulk delete multiple edges. |
-| `edges_to_json(limit=None, offset=None) -> list[dict]` | Export all edges as JSON. |
-| `merge_edge(edge, update_weight=True) -> EdgeMergeResult` | Insert or update an edge matched by (source_id, target_id, relation). |
-| `bulk_merge_edges(edges, update_weight=True) -> list[EdgeMergeResult]` | Bulk insert-or-update edges. |
+| `insert_node(node) -> UUID` | Insert a node. |
+| `bulk_insert_nodes(nodes) -> list[Node]` | Bulk insert. |
+| `merge_node(node, match_keys, strategy=UPDATE) -> MergeResult` | Insert or update by property match. |
+| `bulk_merge_nodes(nodes, match_keys, ...) -> list[MergeResult]` | Bulk merge. |
+| `get_node(node_id) -> Node` | Get by ID. |
+| `update_node(node_id, **kwargs) -> bool` | Update fields. |
+| `delete_node(node_id)` | Delete node and its edges. |
+| `bulk_delete_nodes(node_ids)` | Bulk delete. |
+| `nodes_by_attribute(attr, value) -> list[Node]` | Query by property. |
 
-### Search & Similarity
+### Edges
 
 | Method | Description |
 |--------|-------------|
-| `nearest_nodes(vector: list[float], limit: int) -> list[NearestNode]` | Find nearest neighbors by vector similarity. |
-| `search_nodes(query_text: str, limit: int = 10) -> list[SearchResult]` | Full-text search across node properties (BM25). |
-| `hybrid_search(query_text, query_vector, limit=10, text_weight=0.5, vector_weight=0.5) -> list[SearchResult]` | Combined text + vector search with configurable weights. |
-| `create_index()` | Create an HNSW index on node vectors for faster search. |
-| `set_vector_length(vector_length)` | Set the vector dimension for the database. |
+| `insert_edge(edge)` | Insert an edge. |
+| `bulk_insert_edges(edges)` | Bulk insert. |
+| `merge_edge(edge) -> EdgeMergeResult` | Insert or update by (source, target, relation). |
+| `bulk_merge_edges(edges) -> list[EdgeMergeResult]` | Bulk merge. |
+| `get_edge(edge_id) -> Edge` | Get by ID. |
+| `update_edge(edge_id, **kwargs) -> bool` | Update fields. |
+| `delete_edge(source_id, target_id)` | Delete by endpoints. |
+| `bulk_delete_edges(edge_ids)` | Bulk delete. |
 
-### Retrieval & Q&A
-
-| Method | Description |
-|--------|-------------|
-| `retrieve(query, query_vector, max_hops=2, max_tokens=4000, ...) -> RetrievalResult` | Full GraphRAG pipeline: hybrid search → graph expansion → context assembly. |
-| `ask(query, query_vector, llm_callable=None, ...) -> dict` | End-to-end Q&A: retrieval + LLM generation. |
-
-### Graph Traversal
+### Search
 
 | Method | Description |
 |--------|-------------|
-| `connected_nodes(node_id: uuid.UUID) -> list[Node]` | Retrieve all nodes connected to a given node. |
-| `query() -> QueryBuilder` | Return a fluent query builder for composable, parameterized queries. |
+| `nearest_nodes(vector, limit) -> list[NearestNode]` | Vector similarity search. |
+| `search_nodes(query_text, limit=10) -> list[SearchResult]` | Full-text BM25 search. |
+| `hybrid_search(query_text, query_vector, ...) -> list[SearchResult]` | Combined text + vector search. |
+| `create_index()` | Create HNSW index for faster vector search. |
+
+### Retrieval
+
+| Method | Description |
+|--------|-------------|
+| `retrieve(query, query_vector, ...) -> RetrievalResult` | Full GraphRAG retrieval pipeline. |
+| `ask(query, query_vector, llm_callable, ...) -> dict` | Retrieval + LLM generation. |
+
+### Traversal
+
+| Method | Description |
+|--------|-------------|
+| `connected_nodes(node_id) -> list[Node]` | All nodes connected to a node. |
+| `query() -> QueryBuilder` | Fluent query builder. |
 
 ### Import / Export
 
 | Method | Description |
 |--------|-------------|
-| `export_graph(format='json')` | Export the graph. Formats: `'json'`, `'json_string'`, `'csv'`, `'graphml'`. |
-| `import_graph(data, format='json')` | Import a graph from the given data and format. |
-
-### Utility
-
-| Method | Description |
-|--------|-------------|
-| `print_json()` | Print a JSON representation of all nodes and edges. |
+| `export_graph(format='json')` | Export as JSON, CSV, GraphML, or JSON string. |
+| `import_graph(data, format='json')` | Import from any supported format. |
 
 ## Examples
 
-See the `examples/` directory for complete usage examples:
+See `examples/` for complete usage:
 
-- **`openai_example.py`** — Uses OpenAI embeddings for node creation, similarity search, and attribute queries
-- **`lexical_graph.py`** — Wikipedia text extraction with SentenceTransformer embeddings
-- **`dspy_example_typed_pred.py`** — Knowledge graph extraction from unstructured text using DSPy
+- **`openai_example.py`** — OpenAI embeddings, similarity search, attribute queries
+- **`lexical_graph.py`** — Wikipedia text with SentenceTransformer embeddings
+- **`dspy_example_typed_pred.py`** — Knowledge graph extraction with DSPy
 
 ## Testing
-265 unit tests covering all functionality in `tests/tests.py`.
 
-### Running Tests
+265 tests covering all functionality.
+
 ```sh
 python3 -m pytest tests/tests.py -v
 ```
 
 ## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+
+MIT License. See [LICENSE](LICENSE).
 
 ## Contributing
-Contributions are welcome! Please open an issue or submit a pull request.
+
+Contributions welcome — open an issue or submit a PR.
