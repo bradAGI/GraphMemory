@@ -99,6 +99,7 @@ class GraphMemory:
         self.retry_base_delay = retry_base_delay
         self._lock = threading.RLock()
         self._fts_initialized = False
+        self._fts_dirty = True
         self._closed = False
         self.conn = duckdb.connect(database=self.database)
         self._load_vss_extension()
@@ -145,7 +146,10 @@ class GraphMemory:
                 pass
             self.conn = duckdb.connect(database=self.database)
             self._load_vss_extension()
+            self._load_fts_extension()
             self._configure_database()
+            self._fts_initialized = False
+            self._fts_dirty = True
             logger.info("Reconnection successful.")
 
     def close(self):
@@ -225,6 +229,7 @@ class GraphMemory:
                     (str(node.id), node.type, json.dumps(node.properties), node.vector if node.vector else [0.0] * self.vector_length)
                 ).fetchone()
                 if result:
+                    self._fts_dirty = True
                     logger.info(f"Node inserted with ID: {result[0]}")
                 return result[0] if result else None
         except duckdb.Error as e:
@@ -268,6 +273,8 @@ class GraphMemory:
                     if result:
                         node.id = result[0]
                         inserted.append(node)
+                if inserted:
+                    self._fts_dirty = True
                 return inserted
         except duckdb.Error as e:
             logger.error(f"Error during bulk insert nodes: {e}")
@@ -295,6 +302,7 @@ class GraphMemory:
                     "DELETE FROM edges WHERE source_id = ? OR target_id = ?;", (str(node_id), str(node_id)))
                 cur.execute(
                     "DELETE FROM nodes WHERE id = ?;", (str(node_id),))
+                self._fts_dirty = True
         except duckdb.Error as e:
             logger.error(f"Error deleting node: {e}")
 
@@ -312,6 +320,7 @@ class GraphMemory:
                     id_strs + id_strs)
                 cur.execute(
                     f"DELETE FROM nodes WHERE id IN ({placeholders});", id_strs)
+                self._fts_dirty = True
         except duckdb.Error as e:
             logger.error(f"Error during bulk delete nodes: {e}")
 
@@ -365,6 +374,7 @@ class GraphMemory:
                 if not updated:
                     logger.error(f"Node {node_id} not found.")
                     return False
+                self._fts_dirty = True
                 logger.info(f"Node {node_id} updated.")
                 return True
         except duckdb.Error as e:
@@ -846,14 +856,23 @@ class GraphMemory:
         return sql_query + ";"
 
     def _rebuild_fts_index(self):
-        """Rebuild the FTS index on the nodes properties column."""
+        """Rebuild the FTS index on the nodes properties column only if data has changed."""
+        if self._fts_initialized and not self._fts_dirty:
+            return
         try:
             self.conn.execute(
                 "PRAGMA create_fts_index('nodes', 'id', 'properties', stemmer='porter', overwrite=1)"
             )
             self._fts_initialized = True
+            self._fts_dirty = False
         except duckdb.Error as e:
             logger.error(f"Error creating FTS index: {e}")
+
+    def reindex(self):
+        """Force a rebuild of the FTS index, regardless of dirty state."""
+        with self._lock:
+            self._fts_dirty = True
+            self._rebuild_fts_index()
 
     def search_nodes(self, query_text: str, limit: int = 10) -> list[SearchResult]:
         """Full-text search on node properties using DuckDB FTS extension (BM25 scoring)."""
@@ -971,6 +990,17 @@ class GraphMemory:
             except Exception as e:
                 self.conn.execute("ROLLBACK;")
                 raise e
+
+    def to_networkx(self):
+        """Export this graph to a NetworkX DiGraph.
+
+        Requires the ``networkx`` package (install via ``pip install graphmemory[algorithms]``).
+
+        Returns:
+            A ``networkx.DiGraph`` with all nodes and edges from this instance.
+        """
+        from graphmemory.algorithms import to_networkx
+        return to_networkx(self)
 
     def __enter__(self):
         return self
