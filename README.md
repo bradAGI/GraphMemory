@@ -1,6 +1,8 @@
 [![](https://dcbadge.limes.pink/api/server/https://discord.gg/DSS3DmStV8)](https://discord.gg/DSS3DmStV8)
 
-# GraphMemory
+# GraphMemory - GraphRAG Database
+
+![GraphMemory](https://github.com/bradAGI/GraphMemory/assets/46579244/9897dc2a-46c9-42e0-a8d3-2dcb1d93e6ae)
 
 An embedded graph database for RAG and knowledge graph applications, powered by [DuckDB](https://duckdb.org/). Vector similarity search, full-text search, hybrid search, merge/upsert, graph traversal, and a full GraphRAG retrieval pipeline — all in a single Python package.
 
