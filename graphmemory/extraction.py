@@ -10,7 +10,8 @@ Requires the ``dspy`` optional dependency:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import TYPE_CHECKING, Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -296,3 +297,124 @@ def extract_and_merge(
         len(edge_results),
     )
     return node_results, edge_results
+
+
+# ---------------------------------------------------------------------------
+# Parallel extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_nodes_chunk(chunk: str) -> list[Node]:
+    """Extract nodes from a single chunk (thread-safe, no DB access)."""
+    return extract_nodes(chunk, sentences=[chunk])
+
+
+def _extract_edges_chunk(chunk: str, nodes: list[Node]) -> list[Edge]:
+    """Extract edges from a single chunk given known nodes (thread-safe)."""
+    return extract_edges(chunk, nodes, sentences=[chunk])
+
+
+def extract_and_merge_parallel(
+    graph: GraphMemory,
+    chunks: list[str],
+    match_keys: list[str] | None = None,
+    match_type: bool = True,
+    strategy: MergeStrategy = MergeStrategy.UPDATE,
+    similarity_threshold: float = 1.0,
+    vector_threshold: float | None = None,
+    max_workers: int = 8,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[list[MergeResult], list[EdgeMergeResult]]:
+    """Extract from multiple text chunks in parallel, then merge sequentially.
+
+    Runs in two parallel phases to maximize LLM throughput:
+      1. Node extraction — all chunks concurrently (saturate RPM)
+      2. Edge extraction — all chunks concurrently (with all extracted nodes as context)
+    Then merges into DB sequentially.
+
+    Args:
+        graph: A :class:`~graphmemory.database.GraphMemory` instance.
+        chunks: List of text chunks to process.
+        match_keys: Property names to match nodes on (default ``["name"]``).
+        match_type: Also require ``node.type`` to match.
+        strategy: How to merge properties on match.
+        similarity_threshold: Jaro-Winkler threshold for fuzzy matching.
+        vector_threshold: Max cosine distance for vector similarity.
+        max_workers: Max concurrent LLM calls (match your RPM headroom).
+        on_progress: Optional callback ``(phase, completed, total)``.
+
+    Returns:
+        Aggregated ``(node_results, edge_results)`` across all chunks.
+    """
+    if match_keys is None:
+        match_keys = ["name"]
+
+    total = len(chunks)
+
+    # Phase 1: Extract nodes from ALL chunks in parallel
+    chunk_nodes: dict[int, list[Node]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(_extract_nodes_chunk, chunk): i
+            for i, chunk in enumerate(chunks)
+        }
+        done = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                chunk_nodes[idx] = future.result()
+            except Exception as e:
+                logger.warning("Node extraction failed for chunk %d: %s", idx + 1, e)
+                chunk_nodes[idx] = []
+            done += 1
+            if on_progress:
+                on_progress("nodes", done, total)
+
+    # Merge all nodes into DB sequentially to build the full node set
+    all_node_results: list[MergeResult] = []
+    for idx in range(total):
+        nodes = chunk_nodes.get(idx, [])
+        if nodes:
+            results = graph.bulk_merge_nodes(
+                nodes, match_keys=match_keys, match_type=match_type,
+                strategy=strategy, similarity_threshold=similarity_threshold,
+                vector_threshold=vector_threshold,
+            )
+            all_node_results.extend(results)
+
+    # Build complete node list for edge extraction context
+    all_nodes = [r.node for r in all_node_results]
+    logger.info("Phase 1 complete: %d nodes extracted and merged.", len(all_nodes))
+
+    # Phase 2: Extract edges from ALL chunks in parallel (with full node context)
+    chunk_edges: dict[int, list[Edge]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(_extract_edges_chunk, chunk, all_nodes): i
+            for i, chunk in enumerate(chunks)
+        }
+        done = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                chunk_edges[idx] = future.result()
+            except Exception as e:
+                logger.warning("Edge extraction failed for chunk %d: %s", idx + 1, e)
+                chunk_edges[idx] = []
+            done += 1
+            if on_progress:
+                on_progress("edges", done, total)
+
+    # Merge all edges into DB sequentially
+    all_edge_results: list[EdgeMergeResult] = []
+    for idx in range(total):
+        edges = chunk_edges.get(idx, [])
+        if edges:
+            results = graph.bulk_merge_edges(edges)
+            all_edge_results.extend(results)
+
+    logger.info(
+        "Parallel extraction complete: %d chunks, %d nodes, %d edges.",
+        total, len(all_node_results), len(all_edge_results),
+    )
+    return all_node_results, all_edge_results
