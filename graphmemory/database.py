@@ -1180,6 +1180,276 @@ class GraphMemory:
         print("Nodes JSON:", json.dumps(nodes_json, indent=2))
         print("Edges JSON:", json.dumps(edges_json, indent=2))
 
+    def visualize(self, output: str | None = None, open_browser: bool = True) -> str:
+        """Generate an interactive graph visualization and open it in the browser.
+
+        Args:
+            output: File path to save the HTML. If None, uses a temp file.
+            open_browser: Whether to auto-open in the default browser.
+
+        Returns:
+            The path to the generated HTML file.
+        """
+        import tempfile
+        import webbrowser
+
+        nodes_json = self.nodes_to_json()
+        edges_json = self.edges_to_json()
+
+        # Build type color map
+        types = sorted({n.get("type") or "None" for n in nodes_json})
+        palette = [
+            "#58a6ff", "#3fb950", "#bc8cff", "#f0883e", "#f778ba",
+            "#d29922", "#f85149", "#56d4dd", "#8b949e", "#6cb6ff",
+        ]
+        type_colors = {t: palette[i % len(palette)] for i, t in enumerate(types)}
+
+        html = self._VISUALIZE_TEMPLATE.replace("__NODES_JSON__", json.dumps(nodes_json))
+        html = html.replace("__EDGES_JSON__", json.dumps(edges_json))
+        html = html.replace("__TYPE_COLORS__", json.dumps(type_colors))
+
+        if output is None:
+            fd, output = tempfile.mkstemp(suffix=".html", prefix="graphmemory_")
+            os.close(fd)
+
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        if open_browser:
+            webbrowser.open(f"file://{os.path.abspath(output)}")
+
+        logger.info(f"Visualization saved to {output}")
+        return output
+
+    _VISUALIZE_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraphMemory Visualizer</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d1117; color: #e6edf3; font-family: -apple-system, 'Segoe UI', sans-serif; overflow: hidden; }
+#container { display: flex; height: 100vh; }
+#graph { flex: 1; position: relative; }
+svg { width: 100%; height: 100%; }
+#sidebar { width: 340px; background: #161b22; border-left: 1px solid #30363d; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+#sidebar h2 { font-size: 18px; color: #58a6ff; font-weight: 700; }
+#sidebar h3 { font-size: 14px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-top: 8px; }
+#search { width: 100%; padding: 10px 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #e6edf3; font-size: 14px; outline: none; }
+#search:focus { border-color: #58a6ff; }
+#search::placeholder { color: #484f58; }
+#filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.filter-btn { padding: 4px 12px; border-radius: 20px; border: 1px solid; font-size: 12px; cursor: pointer; background: transparent; font-weight: 600; transition: opacity 0.2s; }
+.filter-btn.inactive { opacity: 0.3; }
+#detail { display: none; flex-direction: column; gap: 8px; }
+#detail .label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+#detail .value { font-size: 14px; color: #e6edf3; word-break: break-all; }
+#detail .prop-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d; }
+#detail .prop-key { color: #8b949e; font-size: 13px; }
+#detail .prop-val { color: #e6edf3; font-size: 13px; max-width: 180px; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+#edges-list { font-size: 13px; }
+#edges-list .edge-item { padding: 4px 0; border-bottom: 1px solid #21262d; color: #8b949e; }
+#edges-list .edge-item span { color: #e6edf3; }
+#stats { font-size: 12px; color: #484f58; text-align: center; padding-top: 8px; border-top: 1px solid #21262d; }
+.link { stroke-opacity: 0.4; }
+.link.highlighted { stroke-opacity: 1; stroke-width: 3px !important; }
+.node circle { stroke-width: 2px; cursor: pointer; transition: r 0.2s; }
+.node circle.highlighted { stroke: #fff; stroke-width: 3px; }
+.node text { font-size: 11px; fill: #e6edf3; pointer-events: none; text-anchor: middle; }
+.link-label { font-size: 10px; fill: #484f58; pointer-events: none; text-anchor: middle; }
+.link-label.highlighted { fill: #e6edf3; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="graph"></div>
+  <div id="sidebar">
+    <h2>GraphMemory</h2>
+    <input id="search" type="text" placeholder="Search nodes..." />
+    <div>
+      <h3>Node Types</h3>
+      <div id="filters"></div>
+    </div>
+    <div id="detail">
+      <h3>Selected Node</h3>
+      <div id="node-type"></div>
+      <div id="node-id"></div>
+      <h3>Properties</h3>
+      <div id="node-props"></div>
+      <h3>Edges</h3>
+      <div id="edges-list"></div>
+    </div>
+    <div id="stats"></div>
+  </div>
+</div>
+<script>
+const nodes = __NODES_JSON__;
+const edges = __EDGES_JSON__;
+const typeColors = __TYPE_COLORS__;
+
+const width = document.getElementById("graph").clientWidth;
+const height = document.getElementById("graph").clientHeight;
+
+// Build degree map
+const degree = {};
+nodes.forEach(n => degree[n.id] = 0);
+edges.forEach(e => { degree[e.source_id] = (degree[e.source_id] || 0) + 1; degree[e.target_id] = (degree[e.target_id] || 0) + 1; });
+
+const svg = d3.select("#graph").append("svg");
+const g = svg.append("g");
+
+// Zoom
+const zoom = d3.zoom().scaleExtent([0.1, 8]).on("zoom", e => g.attr("transform", e.transform));
+svg.call(zoom);
+
+// Simulation
+const sim = d3.forceSimulation(nodes.map(n => ({ ...n, _id: n.id })))
+  .force("link", d3.forceLink(edges.map(e => ({ ...e, source: e.source_id, target: e.target_id })))
+    .id(d => d._id || d.id).distance(120).strength(0.5))
+  .force("charge", d3.forceManyBody().strength(-300))
+  .force("center", d3.forceCenter(width / 2, height / 2))
+  .force("collision", d3.forceCollide().radius(30));
+
+const simNodes = sim.nodes();
+const simLinks = sim.force("link").links();
+
+// Draw edges
+const link = g.append("g").selectAll("line").data(simLinks).join("line")
+  .attr("class", "link").attr("stroke", "#30363d").attr("stroke-width", d => Math.max(1, (d.weight || 1) * 1.5));
+
+const linkLabel = g.append("g").selectAll("text").data(simLinks).join("text")
+  .attr("class", "link-label").text(d => d.relation || "");
+
+// Draw nodes
+const node = g.append("g").selectAll("g").data(simNodes).join("g").attr("class", "node");
+
+node.append("circle")
+  .attr("r", d => 8 + Math.min((degree[d._id] || 0) * 2, 16))
+  .attr("fill", d => typeColors[d.type || "None"] || "#8b949e")
+  .attr("stroke", d => d3.color(typeColors[d.type || "None"] || "#8b949e").brighter(0.5));
+
+node.append("text").attr("dy", d => -(12 + Math.min((degree[d._id] || 0) * 2, 16)))
+  .text(d => {
+    const p = typeof d.properties === "string" ? JSON.parse(d.properties) : d.properties;
+    return p?.name || p?.label || p?.title || d.type || d._id.slice(0, 8);
+  });
+
+// Drag
+node.call(d3.drag()
+  .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+  .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+  .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+);
+
+// Tick
+sim.on("tick", () => {
+  link.attr("x1", d => d.source.x).attr("y1", d => d.source.y).attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+  linkLabel.attr("x", d => (d.source.x + d.target.x) / 2).attr("y", d => (d.source.y + d.target.y) / 2 - 6);
+  node.attr("transform", d => `translate(${d.x},${d.y})`);
+});
+
+// Hover highlight
+node.on("mouseover", (e, d) => {
+  const connected = new Set();
+  simLinks.forEach(l => {
+    const sid = typeof l.source === "object" ? l.source._id : l.source;
+    const tid = typeof l.target === "object" ? l.target._id : l.target;
+    if (sid === d._id) connected.add(tid);
+    if (tid === d._id) connected.add(sid);
+  });
+  connected.add(d._id);
+  node.select("circle").classed("highlighted", n => connected.has(n._id));
+  node.style("opacity", n => connected.has(n._id) ? 1 : 0.15);
+  link.classed("highlighted", l => {
+    const sid = typeof l.source === "object" ? l.source._id : l.source;
+    const tid = typeof l.target === "object" ? l.target._id : l.target;
+    return sid === d._id || tid === d._id;
+  });
+  link.style("opacity", l => {
+    const sid = typeof l.source === "object" ? l.source._id : l.source;
+    const tid = typeof l.target === "object" ? l.target._id : l.target;
+    return (sid === d._id || tid === d._id) ? 1 : 0.05;
+  });
+  linkLabel.classed("highlighted", l => {
+    const sid = typeof l.source === "object" ? l.source._id : l.source;
+    const tid = typeof l.target === "object" ? l.target._id : l.target;
+    return sid === d._id || tid === d._id;
+  });
+}).on("mouseout", () => {
+  node.select("circle").classed("highlighted", false);
+  node.style("opacity", 1);
+  link.classed("highlighted", false).style("opacity", 1);
+  linkLabel.classed("highlighted", false);
+});
+
+// Click detail
+node.on("click", (e, d) => {
+  const detail = document.getElementById("detail");
+  detail.style.display = "flex";
+  const props = typeof d.properties === "string" ? JSON.parse(d.properties) : d.properties;
+  document.getElementById("node-type").innerHTML = `<span class="label">Type</span><span class="value">${d.type || "None"}</span>`;
+  document.getElementById("node-id").innerHTML = `<span class="label">ID</span><span class="value" style="font-size:11px">${d._id}</span>`;
+  let propsHtml = "";
+  if (props) Object.entries(props).forEach(([k, v]) => {
+    propsHtml += `<div class="prop-row"><span class="prop-key">${k}</span><span class="prop-val">${typeof v === "object" ? JSON.stringify(v) : v}</span></div>`;
+  });
+  document.getElementById("node-props").innerHTML = propsHtml || '<span class="value">None</span>';
+  let edgesHtml = "";
+  simLinks.forEach(l => {
+    const sid = typeof l.source === "object" ? l.source._id : l.source;
+    const tid = typeof l.target === "object" ? l.target._id : l.target;
+    if (sid === d._id) edgesHtml += `<div class="edge-item">→ <span>${l.relation || "?"}</span> → ${tid.slice(0,8)}…</div>`;
+    if (tid === d._id) edgesHtml += `<div class="edge-item">← <span>${l.relation || "?"}</span> ← ${sid.slice(0,8)}…</div>`;
+  });
+  document.getElementById("edges-list").innerHTML = edgesHtml || '<span class="value">None</span>';
+});
+
+// Search
+document.getElementById("search").addEventListener("input", function() {
+  const q = this.value.toLowerCase();
+  if (!q) { node.style("opacity", 1); link.style("opacity", 1); return; }
+  node.style("opacity", d => {
+    const props = typeof d.properties === "string" ? JSON.parse(d.properties) : d.properties;
+    const text = JSON.stringify(props || {}).toLowerCase() + (d.type || "").toLowerCase();
+    return text.includes(q) ? 1 : 0.08;
+  });
+});
+
+// Type filters
+const filtersEl = document.getElementById("filters");
+const activeTypes = new Set(Object.keys(typeColors));
+Object.entries(typeColors).forEach(([type, color]) => {
+  const btn = document.createElement("button");
+  btn.className = "filter-btn";
+  btn.textContent = type;
+  btn.style.color = color;
+  btn.style.borderColor = color;
+  btn.addEventListener("click", () => {
+    if (activeTypes.has(type)) { activeTypes.delete(type); btn.classList.add("inactive"); }
+    else { activeTypes.add(type); btn.classList.remove("inactive"); }
+    node.style("display", d => activeTypes.has(d.type || "None") ? null : "none");
+    link.style("display", l => {
+      const sType = (typeof l.source === "object" ? l.source.type : null) || "None";
+      const tType = (typeof l.target === "object" ? l.target.type : null) || "None";
+      return activeTypes.has(sType) && activeTypes.has(tType) ? null : "none";
+    });
+    linkLabel.style("display", l => {
+      const sType = (typeof l.source === "object" ? l.source.type : null) || "None";
+      const tType = (typeof l.target === "object" ? l.target.type : null) || "None";
+      return activeTypes.has(sType) && activeTypes.has(tType) ? null : "none";
+    });
+  });
+  filtersEl.appendChild(btn);
+});
+
+// Stats
+document.getElementById("stats").textContent = `${nodes.length} nodes · ${edges.length} edges`;
+</script>
+</body>
+</html>"""
+
     @with_retry()
     def export_graph(self, format: str = 'json'):
         """Export the full graph. Formats: json, json_string, csv, graphml."""

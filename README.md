@@ -17,6 +17,7 @@ An embedded graph database for RAG and knowledge graph applications, powered by 
 - **DSPy Extraction** — Entity/relationship extraction from text via DSPy (optional)
 - **Graph Algorithms** — PageRank, centrality, components via NetworkX (optional)
 - **Import / Export** — JSON, CSV, GraphML
+- **Visualizer** — Interactive D3.js force-directed graph in the browser
 - **Thread-Safe** — Connection pooling, transactions, automatic retry with exponential backoff
 
 ## Installation
@@ -176,6 +177,20 @@ data = graph.export_graph(format="json")       # also: "csv", "graphml", "json_s
 graph.import_graph(data, format="json")
 ```
 
+### Visualizer
+
+Interactive D3.js force-directed graph visualization — opens in your browser with zero dependencies.
+
+```python
+# Open in browser
+graph.visualize()
+
+# Save to file
+graph.visualize(output="my_graph.html", open_browser=False)
+```
+
+Features: drag nodes, zoom/pan, hover to highlight connections, click for detail panel, search bar, filter by node type.
+
 ## Data Models
 
 | Model | Fields |
@@ -258,6 +273,7 @@ All IDs are auto-generated UUIDs. All models are [Pydantic](https://docs.pydanti
 |--------|-------------|
 | `export_graph(format='json')` | Export as JSON, CSV, GraphML, or JSON string. |
 | `import_graph(data, format='json')` | Import from any supported format. |
+| `visualize(output=None, open_browser=True) -> str` | Interactive D3.js graph visualization in the browser. |
 
 ## Examples
 
@@ -269,7 +285,7 @@ See `examples/` for complete usage:
 
 ## Testing
 
-291 tests covering all functionality.
+296 tests covering all functionality.
 
 ```sh
 python3 -m pytest tests/tests.py -v

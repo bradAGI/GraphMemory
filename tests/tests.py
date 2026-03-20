@@ -2871,5 +2871,83 @@ class TestCompactAfterDelete(unittest.TestCase):
         self.assertEqual(len(self.db.nodes_to_json()), 0)
 
 
+class TestVisualize(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+        self.alice = Node(type="Person", properties={"name": "Alice"}, vector=[1.0, 0.0, 0.0])
+        self.bob = Node(type="Person", properties={"name": "Bob"}, vector=[0.0, 1.0, 0.0])
+        self.acme = Node(type="Company", properties={"name": "Acme"}, vector=[0.0, 0.0, 1.0])
+        self.db.insert_node(self.alice)
+        self.db.insert_node(self.bob)
+        self.db.insert_node(self.acme)
+        self.db.insert_edge(Edge(source_id=self.alice.id, target_id=self.bob.id, relation="knows"))
+        self.db.insert_edge(Edge(source_id=self.alice.id, target_id=self.acme.id, relation="works_at"))
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_visualize_returns_path(self):
+        path = self.db.visualize(open_browser=False)
+        self.assertTrue(os.path.exists(path))
+        os.unlink(path)
+
+    def test_visualize_output_file(self):
+        import tempfile
+        output = tempfile.mktemp(suffix=".html")
+        try:
+            path = self.db.visualize(output=output, open_browser=False)
+            self.assertEqual(path, output)
+            self.assertTrue(os.path.exists(path))
+            with open(path, "r") as f:
+                html = f.read()
+            self.assertIn("GraphMemory", html)
+            self.assertIn("Alice", html)
+            self.assertIn("Bob", html)
+            self.assertIn("Acme", html)
+            self.assertIn("knows", html)
+            self.assertIn("works_at", html)
+        finally:
+            if os.path.exists(output):
+                os.unlink(output)
+
+    def test_visualize_contains_d3(self):
+        import tempfile
+        output = tempfile.mktemp(suffix=".html")
+        try:
+            self.db.visualize(output=output, open_browser=False)
+            with open(output, "r") as f:
+                html = f.read()
+            self.assertIn("d3.v7", html)
+            self.assertIn("forceSimulation", html)
+        finally:
+            if os.path.exists(output):
+                os.unlink(output)
+
+    def test_visualize_empty_graph(self):
+        db = GraphMemory(database=':memory:', vector_length=3)
+        path = db.visualize(open_browser=False)
+        self.assertTrue(os.path.exists(path))
+        with open(path, "r") as f:
+            html = f.read()
+        self.assertIn("const nodes = [];", html)
+        self.assertIn("const edges = [];", html)
+        os.unlink(path)
+        db.close()
+
+    def test_visualize_type_colors(self):
+        import tempfile
+        output = tempfile.mktemp(suffix=".html")
+        try:
+            self.db.visualize(output=output, open_browser=False)
+            with open(output, "r") as f:
+                html = f.read()
+            self.assertIn("Person", html)
+            self.assertIn("Company", html)
+        finally:
+            if os.path.exists(output):
+                os.unlink(output)
+
+
 if __name__ == '__main__':
     unittest.main()
