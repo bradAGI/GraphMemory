@@ -86,7 +86,8 @@ class GraphMemory:
         'inner_product': {'function': 'array_negative_inner_product', 'hnsw_metric': 'ip'},
     }
 
-    def __init__(self, database=None, vector_length=3, distance_metric='l2', max_retries=3, retry_base_delay=0.1):
+    def __init__(self, database=None, vector_length=3, distance_metric='l2', max_retries=3, retry_base_delay=0.1,
+                 hnsw_ef_construction=128, hnsw_ef_search=64, hnsw_m=16, auto_index=True):
         if distance_metric not in self.DISTANCE_METRICS:
             raise ValueError(
                 f"Invalid distance_metric '{distance_metric}'. "
@@ -97,9 +98,13 @@ class GraphMemory:
         self.distance_metric = distance_metric
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.hnsw_ef_construction = hnsw_ef_construction
+        self.hnsw_ef_search = hnsw_ef_search
+        self.hnsw_m = hnsw_m
         self._lock = threading.RLock()
         self._fts_initialized = False
         self._fts_dirty = True
+        self._hnsw_indexed = False
         self._closed = False
         self.conn = duckdb.connect(database=self.database)
         self._load_vss_extension()
@@ -115,6 +120,9 @@ class GraphMemory:
         if not nodes_exist or not edges_exist:
             self._create_tables()
             logger.info("Tables created or verified successfully.")
+
+        if auto_index:
+            self._ensure_hnsw_index()
 
     def cursor(self):
         """Return a new DuckDB cursor for individual operations.
@@ -150,6 +158,8 @@ class GraphMemory:
             self._configure_database()
             self._fts_initialized = False
             self._fts_dirty = True
+            self._hnsw_indexed = False
+            self._ensure_hnsw_index()
             logger.info("Reconnection successful.")
 
     def close(self):
@@ -191,6 +201,8 @@ class GraphMemory:
 
     def set_vector_length(self, vector_length):
         self.vector_length = vector_length
+        self._hnsw_indexed = False
+        self._ensure_hnsw_index()
         logger.info(f"Vector length set to: {self.vector_length}")
 
     def _create_tables(self):
@@ -303,6 +315,7 @@ class GraphMemory:
                 cur.execute(
                     "DELETE FROM nodes WHERE id = ?;", (str(node_id),))
                 self._fts_dirty = True
+            self.compact_index()
         except duckdb.Error as e:
             logger.error(f"Error deleting node: {e}")
 
@@ -321,6 +334,7 @@ class GraphMemory:
                 cur.execute(
                     f"DELETE FROM nodes WHERE id IN ({placeholders});", id_strs)
                 self._fts_dirty = True
+            self.compact_index()
         except duckdb.Error as e:
             logger.error(f"Error during bulk delete nodes: {e}")
 
@@ -920,15 +934,53 @@ class GraphMemory:
             logger.error(f"Error updating edge: {e}")
             return False
 
+    def _ensure_hnsw_index(self):
+        """Create HNSW index if not already present. Called automatically on init."""
+        if self._hnsw_indexed:
+            return
+        try:
+            nodes_exist = self.conn.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'nodes';"
+            ).fetchone()
+            if nodes_exist:
+                self.create_index()
+        except duckdb.Error:
+            pass
+
     @with_retry()
-    def create_index(self):
+    def create_index(self, ef_construction: int | None = None, ef_search: int | None = None, m: int | None = None):
+        """Create or recreate the HNSW vector index.
+
+        Args:
+            ef_construction: Candidate vertices during build (default from init).
+            ef_search: Candidate vertices during search (default from init).
+            m: Max neighbors per vertex (default from init).
+        """
+        ef_c = ef_construction or self.hnsw_ef_construction
+        ef_s = ef_search or self.hnsw_ef_search
+        m_val = m or self.hnsw_m
+        hnsw_metric = self.DISTANCE_METRICS[self.distance_metric]['hnsw_metric']
         with self._lock:
             try:
-                hnsw_metric = self.DISTANCE_METRICS[self.distance_metric]['hnsw_metric']
+                # Drop existing index first to allow metric/param changes
+                self.conn.execute("DROP INDEX IF EXISTS vss_idx;")
                 self.conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS vss_idx ON nodes USING HNSW(vector) WITH (metric = '{hnsw_metric}');")
+                    f"CREATE INDEX vss_idx ON nodes USING HNSW(vector) "
+                    f"WITH (metric = '{hnsw_metric}', ef_construction = {ef_c}, ef_search = {ef_s}, M = {m_val});"
+                )
+                self._hnsw_indexed = True
+                logger.info(f"HNSW index created (metric={hnsw_metric}, ef_construction={ef_c}, ef_search={ef_s}, M={m_val}).")
             except duckdb.Error as e:
-                logger.error(f"Error creating index: {e}")
+                logger.error(f"Error creating HNSW index: {e}")
+
+    def compact_index(self):
+        """Compact the HNSW index to reclaim space after deletions."""
+        with self._lock:
+            try:
+                self.conn.execute("PRAGMA hnsw_compact_index('vss_idx');")
+                logger.info("HNSW index compacted.")
+            except duckdb.Error as e:
+                logger.error(f"Error compacting HNSW index: {e}")
 
     @with_retry()
     def nearest_nodes(self, vector: list[float], limit: int) -> list[NearestNode]:
@@ -1334,9 +1386,10 @@ class GraphMemory:
 
             # Collect vector similarity results
             vss_results = {}
+            dist_func = self.DISTANCE_METRICS[self.distance_metric]['function']
             vss_query = f"""
             SELECT id, type, properties, vector,
-                   array_distance(vector, CAST(? AS FLOAT[{self.vector_length}])) AS distance
+                   {dist_func}(vector, CAST(? AS FLOAT[{self.vector_length}])) AS distance
             FROM nodes
             WHERE vector IS NOT NULL
             ORDER BY distance;

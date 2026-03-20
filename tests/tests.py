@@ -2729,5 +2729,147 @@ class TestFuzzyMatching(unittest.TestCase):
         self.assertEqual(remaining, 2)
 
 
+class TestHNSWIndex(unittest.TestCase):
+
+    def test_auto_index_on_init(self):
+        db = GraphMemory(database=':memory:', vector_length=3)
+        self.assertTrue(db._hnsw_indexed)
+        db.close()
+
+    def test_auto_index_disabled(self):
+        db = GraphMemory(database=':memory:', vector_length=3, auto_index=False)
+        self.assertFalse(db._hnsw_indexed)
+        db.close()
+
+    def test_create_index_with_custom_params(self):
+        db = GraphMemory(database=':memory:', vector_length=3, auto_index=False)
+        db.create_index(ef_construction=64, ef_search=32, m=8)
+        self.assertTrue(db._hnsw_indexed)
+        db.close()
+
+    def test_create_index_uses_configured_metric(self):
+        for metric in ['l2', 'cosine', 'inner_product']:
+            db = GraphMemory(database=':memory:', vector_length=3, distance_metric=metric)
+            self.assertTrue(db._hnsw_indexed)
+            db.close()
+
+    def test_create_index_idempotent_recreate(self):
+        db = GraphMemory(database=':memory:', vector_length=3)
+        db.create_index()
+        db.create_index()
+        self.assertTrue(db._hnsw_indexed)
+        db.close()
+
+    def test_set_vector_length_rebuilds_index(self):
+        db = GraphMemory(database=':memory:', vector_length=3)
+        self.assertTrue(db._hnsw_indexed)
+        db._hnsw_indexed = False
+        db.set_vector_length(5)
+        self.assertTrue(db._hnsw_indexed)
+        self.assertEqual(db.vector_length, 5)
+        db.close()
+
+    def test_compact_index_no_error(self):
+        db = GraphMemory(database=':memory:', vector_length=3)
+        node = Node(type="Test", properties={"name": "A"}, vector=[1.0, 0.0, 0.0])
+        db.insert_node(node)
+        db.delete_node(node.id)
+        db.compact_index()
+        db.close()
+
+    def test_reconnect_rebuilds_index(self):
+        import tempfile
+        path = tempfile.mktemp(suffix='.db')
+        try:
+            db = GraphMemory(database=path, vector_length=3)
+            db._hnsw_indexed = False
+            db._reconnect()
+            self.assertTrue(db._hnsw_indexed)
+            db.close()
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_hnsw_params_stored(self):
+        db = GraphMemory(database=':memory:', vector_length=3,
+                         hnsw_ef_construction=256, hnsw_ef_search=128, hnsw_m=32)
+        self.assertEqual(db.hnsw_ef_construction, 256)
+        self.assertEqual(db.hnsw_ef_search, 128)
+        self.assertEqual(db.hnsw_m, 32)
+        db.close()
+
+
+class TestHybridSearchMetric(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3, distance_metric='cosine')
+        self.db.insert_node(Node(type="Doc", properties={"text": "machine learning"}, vector=[1.0, 0.0, 0.0]))
+        self.db.insert_node(Node(type="Doc", properties={"text": "deep learning"}, vector=[0.9, 0.1, 0.0]))
+        self.db.insert_node(Node(type="Doc", properties={"text": "cooking recipes"}, vector=[0.0, 0.0, 1.0]))
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_hybrid_search_uses_cosine_metric(self):
+        results = self.db.hybrid_search(
+            query_text="learning",
+            query_vector=[1.0, 0.0, 0.0],
+            limit=3
+        )
+        self.assertGreater(len(results), 0)
+        # The learning docs should score higher than cooking
+        names = [r.node.properties.get("text") for r in results]
+        self.assertIn("machine learning", names[:2])
+
+    def test_hybrid_search_inner_product(self):
+        db = GraphMemory(database=':memory:', vector_length=3, distance_metric='inner_product')
+        db.insert_node(Node(type="Doc", properties={"text": "similar"}, vector=[1.0, 0.0, 0.0]))
+        db.insert_node(Node(type="Doc", properties={"text": "different"}, vector=[0.0, 0.0, 1.0]))
+        results = db.hybrid_search(
+            query_text="similar",
+            query_vector=[1.0, 0.0, 0.0],
+            limit=2
+        )
+        self.assertGreater(len(results), 0)
+        db.close()
+
+    def test_hybrid_search_l2_metric(self):
+        db = GraphMemory(database=':memory:', vector_length=3, distance_metric='l2')
+        db.insert_node(Node(type="Doc", properties={"text": "near"}, vector=[0.1, 0.0, 0.0]))
+        db.insert_node(Node(type="Doc", properties={"text": "far"}, vector=[9.0, 9.0, 9.0]))
+        results = db.hybrid_search(
+            query_text="near",
+            query_vector=[0.0, 0.0, 0.0],
+            limit=2
+        )
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0].node.properties["text"], "near")
+        db.close()
+
+
+class TestCompactAfterDelete(unittest.TestCase):
+
+    def setUp(self):
+        self.db = GraphMemory(database=':memory:', vector_length=3)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_delete_node_compacts(self):
+        node = Node(type="Test", properties={"name": "A"}, vector=[1.0, 0.0, 0.0])
+        self.db.insert_node(node)
+        # Should not raise — compact_index called internally
+        self.db.delete_node(node.id)
+        self.assertEqual(len(self.db.nodes_to_json()), 0)
+
+    def test_bulk_delete_nodes_compacts(self):
+        n1 = Node(type="Test", properties={"name": "A"}, vector=[1.0, 0.0, 0.0])
+        n2 = Node(type="Test", properties={"name": "B"}, vector=[0.0, 1.0, 0.0])
+        self.db.insert_node(n1)
+        self.db.insert_node(n2)
+        self.db.bulk_delete_nodes([n1.id, n2.id])
+        self.assertEqual(len(self.db.nodes_to_json()), 0)
+
+
 if __name__ == '__main__':
     unittest.main()

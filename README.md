@@ -197,7 +197,7 @@ All IDs are auto-generated UUIDs. All models are [Pydantic](https://docs.pydanti
 
 | Method | Description |
 |--------|-------------|
-| `GraphMemory(database=None, vector_length=3, distance_metric='l2')` | Initialize. `None` = in-memory. |
+| `GraphMemory(database=None, vector_length=3, distance_metric='l2', hnsw_ef_construction=128, hnsw_ef_search=64, hnsw_m=16, auto_index=True)` | Initialize. `None` = in-memory. HNSW index auto-created. |
 | `close()` | Close connection (thread-safe, idempotent). |
 | `transaction()` | Context manager for atomic operations. |
 
@@ -235,7 +235,8 @@ All IDs are auto-generated UUIDs. All models are [Pydantic](https://docs.pydanti
 | `nearest_nodes(vector, limit) -> list[NearestNode]` | Vector similarity search. |
 | `search_nodes(query_text, limit=10) -> list[SearchResult]` | Full-text BM25 search. |
 | `hybrid_search(query_text, query_vector, ...) -> list[SearchResult]` | Combined text + vector search. |
-| `create_index()` | Create HNSW index for faster vector search. |
+| `create_index(ef_construction=None, ef_search=None, m=None)` | Create/recreate HNSW index with tunable params. Auto-called on init. |
+| `compact_index()` | Compact HNSW index to reclaim space after deletions. |
 
 ### Retrieval
 
@@ -268,7 +269,7 @@ See `examples/` for complete usage:
 
 ## Testing
 
-265 tests covering all functionality.
+291 tests covering all functionality.
 
 ```sh
 python3 -m pytest tests/tests.py -v
