@@ -29,6 +29,13 @@ dependencies = [
 [project.optional-dependencies]
 algorithms = ["networkx>=3.6", "scipy>=1.14"]
 extraction = ["dspy>=3.1"]
+examples = [
+    "openai",
+    "sentence-transformers",
+    "langchain",
+    "requests",
+    "dspy>=3.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/bradAGI/GraphMemory"
